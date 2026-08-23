@@ -1,952 +1,784 @@
-# blender_mcp_server.py
-from mcp.server.fastmcp import FastMCP, Context, Image
-import socket
-import json
-import asyncio
-import logging
-import tempfile
-from dataclasses import dataclass
-from contextlib import asynccontextmanager
-from typing import AsyncIterator, Dict, Any, List
+"""
+Blender Model Context Protocol (MCP) Server.
+Exposes strictly typed tool endpoints for AI hosts.
+"""
+
+from __future__ import annotations
+
 import os
-from pathlib import Path
-import base64
-from urllib.parse import urlparse
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
-# Configure logging
-logging.basicConfig(level=logging.INFO, 
-                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-logger = logging.getLogger("BlenderMCPServer")
-
-# Default configuration
-DEFAULT_HOST = "localhost"
-DEFAULT_PORT = 9876
-
-@dataclass
-class BlenderConnection:
-    host: str
-    port: int
-    sock: socket.socket = None  # Changed from 'socket' to 'sock' to avoid naming conflict
-    
-    def connect(self) -> bool:
-        """Connect to the Blender addon socket server"""
-        if self.sock:
-            return True
-            
-        try:
-            self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            self.sock.connect((self.host, self.port))
-            logger.info(f"Connected to Blender at {self.host}:{self.port}")
-            return True
-        except Exception as e:
-            logger.error(f"Failed to connect to Blender: {str(e)}")
-            self.sock = None
-            return False
-    
-    def disconnect(self):
-        """Disconnect from the Blender addon"""
-        if self.sock:
-            try:
-                self.sock.close()
-            except Exception as e:
-                logger.error(f"Error disconnecting from Blender: {str(e)}")
-            finally:
-                self.sock = None
-
-    def receive_full_response(self, sock, buffer_size=8192):
-        """Receive the complete response, potentially in multiple chunks"""
-        chunks = []
-        # Use a consistent timeout value that matches the addon's timeout
-        sock.settimeout(15.0)  # Match the addon's timeout
-        
-        try:
-            while True:
-                try:
-                    chunk = sock.recv(buffer_size)
-                    if not chunk:
-                        # If we get an empty chunk, the connection might be closed
-                        if not chunks:  # If we haven't received anything yet, this is an error
-                            raise Exception("Connection closed before receiving any data")
-                        break
-                    
-                    chunks.append(chunk)
-                    
-                    # Check if we've received a complete JSON object
-                    try:
-                        data = b''.join(chunks)
-                        json.loads(data.decode('utf-8'))
-                        # If we get here, it parsed successfully
-                        logger.info(f"Received complete response ({len(data)} bytes)")
-                        return data
-                    except json.JSONDecodeError:
-                        # Incomplete JSON, continue receiving
-                        continue
-                except socket.timeout:
-                    # If we hit a timeout during receiving, break the loop and try to use what we have
-                    logger.warning("Socket timeout during chunked receive")
-                    break
-                except (ConnectionError, BrokenPipeError, ConnectionResetError) as e:
-                    logger.error(f"Socket connection error during receive: {str(e)}")
-                    raise  # Re-raise to be handled by the caller
-        except socket.timeout:
-            logger.warning("Socket timeout during chunked receive")
-        except Exception as e:
-            logger.error(f"Error during receive: {str(e)}")
-            raise
-            
-        # If we get here, we either timed out or broke out of the loop
-        # Try to use what we have
-        if chunks:
-            data = b''.join(chunks)
-            logger.info(f"Returning data after receive completion ({len(data)} bytes)")
-            try:
-                # Try to parse what we have
-                json.loads(data.decode('utf-8'))
-                return data
-            except json.JSONDecodeError:
-                # If we can't parse it, it's incomplete
-                raise Exception("Incomplete JSON response received")
-        else:
-            raise Exception("No data received")
-
-    def send_command(self, command_type: str, params: Dict[str, Any] = None) -> Dict[str, Any]:
-        """Send a command to Blender and return the response"""
-        if not self.sock and not self.connect():
-            raise ConnectionError("Not connected to Blender")
-        
-        command = {
-            "type": command_type,
-            "params": params or {}
-        }
-        
-        try:
-            # Log the command being sent
-            logger.info(f"Sending command: {command_type} with params: {params}")
-            
-            # Send the command
-            self.sock.sendall(json.dumps(command).encode('utf-8'))
-            logger.info(f"Command sent, waiting for response...")
-            
-            # Set a timeout for receiving - use the same timeout as in receive_full_response
-            self.sock.settimeout(15.0)  # Match the addon's timeout
-            
-            # Receive the response using the improved receive_full_response method
-            response_data = self.receive_full_response(self.sock)
-            logger.info(f"Received {len(response_data)} bytes of data")
-            
-            response = json.loads(response_data.decode('utf-8'))
-            logger.info(f"Response parsed, status: {response.get('status', 'unknown')}")
-            
-            if response.get("status") == "error":
-                logger.error(f"Blender error: {response.get('message')}")
-                raise Exception(response.get("message", "Unknown error from Blender"))
-            
-            return response.get("result", {})
-        except socket.timeout:
-            logger.error("Socket timeout while waiting for response from Blender")
-            # Don't try to reconnect here - let the get_blender_connection handle reconnection
-            # Just invalidate the current socket so it will be recreated next time
-            self.sock = None
-            raise Exception("Timeout waiting for Blender response - try simplifying your request")
-        except (ConnectionError, BrokenPipeError, ConnectionResetError) as e:
-            logger.error(f"Socket connection error: {str(e)}")
-            self.sock = None
-            raise Exception(f"Connection to Blender lost: {str(e)}")
-        except json.JSONDecodeError as e:
-            logger.error(f"Invalid JSON response from Blender: {str(e)}")
-            # Try to log what was received
-            if 'response_data' in locals() and response_data:
-                logger.error(f"Raw response (first 200 bytes): {response_data[:200]}")
-            raise Exception(f"Invalid response from Blender: {str(e)}")
-        except Exception as e:
-            logger.error(f"Error communicating with Blender: {str(e)}")
-            # Don't try to reconnect here - let the get_blender_connection handle reconnection
-            self.sock = None
-            raise Exception(f"Communication error with Blender: {str(e)}")
-
-@asynccontextmanager
-async def server_lifespan(server: FastMCP) -> AsyncIterator[Dict[str, Any]]:
-    """Manage server startup and shutdown lifecycle"""
-    # We don't need to create a connection here since we're using the global connection
-    # for resources and tools
-    
-    try:
-        # Just log that we're starting up
-        logger.info("BlenderMCP server starting up")
-        
-        # Try to connect to Blender on startup to verify it's available
-        try:
-            # This will initialize the global connection if needed
-            blender = get_blender_connection()
-            logger.info("Successfully connected to Blender on startup")
-        except Exception as e:
-            logger.warning(f"Could not connect to Blender on startup: {str(e)}")
-            logger.warning("Make sure the Blender addon is running before using Blender resources or tools")
-        
-        # Return an empty context - we're using the global connection
-        yield {}
-    finally:
-        # Clean up the global connection on shutdown
-        global _blender_connection
-        if _blender_connection:
-            logger.info("Disconnecting from Blender on shutdown")
-            _blender_connection.disconnect()
-            _blender_connection = None
-        logger.info("BlenderMCP server shut down")
-
-# Create the MCP server with lifespan support
-mcp = FastMCP(
-    "BlenderMCP",
-    lifespan=server_lifespan
+from blender_mcp.client import default_client
+from blender_mcp.schemas import (
+    AddonManageInput,
+    ArmatureRiggingInput,
+    CameraManageInput,
+    CaptureRenderInput,
+    ColorManagementInput,
+    CompositorManageInput,
+    ConstraintManageInput,
+    ExternalDataInput,
+    GeometryNodesInput,
+    LightManageInput,
+    MaterialManageInput,
+    MeshManipulateInput,
+    MeshPrimitiveInput,
+    ModifierManageInput,
+    ObjectHierarchyInput,
+    ParticleSystemInput,
+    PhysicsSimulationInput,
+    RenderConfigureInput,
+    RenderOutputPassesInput,
+    SceneManageInput,
+    ShaderNodeManageInput,
+    TimelineKeyframeInput,
+    TransformObjectInput,
+    UniversalIOInput,
+    UserPreferencesInput,
+    UVUnwrapInput,
+    ViewportManageInput,
+    WorldManageInput,
 )
 
-# Resource endpoints
+# Optional FastMCP import with fallback
+try:
+    from mcp.server.fastmcp import FastMCP
+    mcp = FastMCP("blender-mcp")
+except ImportError:
+    class DummyMCP:
+        def __init__(self, name: str):
+            self.name = name
+            self._tools = {}
 
-# Global connection for resources (since resources can't access context)
-_blender_connection = None
-_polyhaven_enabled = False  # Add this global variable
+        def tool(self):
+            def decorator(func):
+                self._tools[func.__name__] = func
+                return func
+            return decorator
 
-def get_blender_connection():
-    """Get or create a persistent Blender connection"""
-    global _blender_connection, _polyhaven_enabled  # Add _polyhaven_enabled to globals
-    
-    # If we have an existing connection, check if it's still valid
-    if _blender_connection is not None:
-        try:
-            # First check if PolyHaven is enabled by sending a ping command
-            result = _blender_connection.send_command("get_polyhaven_status")
-            # Store the PolyHaven status globally
-            _polyhaven_enabled = result.get("enabled", False)
-            return _blender_connection
-        except Exception as e:
-            # Connection is dead, close it and create a new one
-            logger.warning(f"Existing connection is no longer valid: {str(e)}")
-            try:
-                _blender_connection.disconnect()
-            except:
-                pass
-            _blender_connection = None
-    
-    # Create a new connection if needed
-    if _blender_connection is None:
-        host = os.getenv("BLENDER_HOST", DEFAULT_HOST)
-        port = int(os.getenv("BLENDER_PORT", DEFAULT_PORT))
-        _blender_connection = BlenderConnection(host=host, port=port)
-        if not _blender_connection.connect():
-            logger.error("Failed to connect to Blender")
-            _blender_connection = None
-            raise Exception("Could not connect to Blender. Make sure the Blender addon is running.")
-        logger.info("Created new persistent connection to Blender")
-    
-    return _blender_connection
+        def run(self):
+            print(f"[{self.name}] Server initialized.")
+
+    mcp = DummyMCP("blender-mcp")
+
+
+# ---------------------------------------------------------------------------
+# 1. Dynamic Reflection & Operator Tools
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def inspect_bpy_path(path: str) -> Dict[str, Any]:
+    """Introspects any arbitrary Blender RNA data path."""
+    return default_client.send_command("inspect_bpy_path", {"path": path})
 
 
 @mcp.tool()
-def get_scene_info(ctx: Context) -> str:
-    """Get detailed information about the current Blender scene"""
-    try:
-        blender = get_blender_connection()
-        result = blender.send_command("get_scene_info")
-        
-        # Just return the JSON representation of what Blender sent us
-        return json.dumps(result, indent=2)
-    except Exception as e:
-        logger.error(f"Error getting scene info from Blender: {str(e)}")
-        return f"Error getting scene info: {str(e)}"
-
-@mcp.tool()
-def get_object_info(ctx: Context, object_name: str) -> str:
-    """
-    Get detailed information about a specific object in the Blender scene.
-    
-    Parameters:
-    - object_name: The name of the object to get information about
-    """
-    try:
-        blender = get_blender_connection()
-        result = blender.send_command("get_object_info", {"name": object_name})
-        
-        # Just return the JSON representation of what Blender sent us
-        return json.dumps(result, indent=2)
-    except Exception as e:
-        logger.error(f"Error getting object info from Blender: {str(e)}")
-        return f"Error getting object info: {str(e)}"
-
-@mcp.tool()
-def get_viewport_screenshot(ctx: Context, max_size: int = 800) -> Image:
-    """
-    Capture a screenshot of the current Blender 3D viewport.
-    
-    Parameters:
-    - max_size: Maximum size in pixels for the largest dimension (default: 800)
-    
-    Returns the screenshot as an Image.
-    """
-    try:
-        blender = get_blender_connection()
-        
-        # Create temp file path
-        temp_dir = tempfile.gettempdir()
-        temp_path = os.path.join(temp_dir, f"blender_screenshot_{os.getpid()}.png")
-        
-        result = blender.send_command("get_viewport_screenshot", {
-            "max_size": max_size,
-            "filepath": temp_path,
-            "format": "png"
-        })
-        
-        if "error" in result:
-            raise Exception(result["error"])
-        
-        if not os.path.exists(temp_path):
-            raise Exception("Screenshot file was not created")
-        
-        # Read the file
-        with open(temp_path, 'rb') as f:
-            image_bytes = f.read()
-        
-        # Delete the temp file
-        os.remove(temp_path)
-        
-        return Image(data=image_bytes, format="png")
-        
-    except Exception as e:
-        logger.error(f"Error capturing screenshot: {str(e)}")
-        raise Exception(f"Screenshot failed: {str(e)}")
+def get_rna_schema(rna_type_name: str) -> Dict[str, Any]:
+    """Queries RNA struct definitions dynamically for any Blender type."""
+    return default_client.send_command("get_rna_schema", {"rna_type_name": rna_type_name})
 
 
 @mcp.tool()
-def execute_blender_code(ctx: Context, code: str) -> str:
-    """
-    Execute arbitrary Python code in Blender. Make sure to do it step-by-step by breaking it into smaller chunks.
-    
-    Parameters:
-    - code: The Python code to execute
-    """
-    try:
-        # Get the global connection
-        blender = get_blender_connection()
-        result = blender.send_command("execute_code", {"code": code})
-        return f"Code executed successfully: {result.get('result', '')}"
-    except Exception as e:
-        logger.error(f"Error executing code: {str(e)}")
-        return f"Error executing code: {str(e)}"
+def execute_operator(
+    operator: str,
+    execution_context: Literal[
+        "EXEC_DEFAULT", "INVOKE_DEFAULT", "EXEC_REGION_WIN", "EXEC_SCREEN", "INVOKE_REGION_WIN"
+    ] = "EXEC_DEFAULT",
+    kwargs: Optional[Dict[str, Any]] = None,
+    context_override: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Executes ANY arbitrary Blender operator with optional kwargs and context overrides."""
+    return default_client.send_command(
+        "execute_operator",
+        {
+            "operator": operator,
+            "execution_context": execution_context,
+            "kwargs": kwargs or {},
+            "context_override": context_override or {},
+        },
+    )
+
 
 @mcp.tool()
-def get_polyhaven_categories(ctx: Context, asset_type: str = "hdris") -> str:
-    """
-    Get a list of categories for a specific asset type on Polyhaven.
-    
-    Parameters:
-    - asset_type: The type of asset to get categories for (hdris, textures, models, all)
-    """
-    try:
-        blender = get_blender_connection()
-        if not _polyhaven_enabled:
-            return "PolyHaven integration is disabled. Select it in the sidebar in BlenderMCP, then run it again."
-        result = blender.send_command("get_polyhaven_categories", {"asset_type": asset_type})
-        
-        if "error" in result:
-            return f"Error: {result['error']}"
-        
-        # Format the categories in a more readable way
-        categories = result["categories"]
-        formatted_output = f"Categories for {asset_type}:\n\n"
-        
-        # Sort categories by count (descending)
-        sorted_categories = sorted(categories.items(), key=lambda x: x[1], reverse=True)
-        
-        for category, count in sorted_categories:
-            formatted_output += f"- {category}: {count} assets\n"
-        
-        return formatted_output
-    except Exception as e:
-        logger.error(f"Error getting Polyhaven categories: {str(e)}")
-        return f"Error getting Polyhaven categories: {str(e)}"
+def get_property(path: str) -> Dict[str, Any]:
+    """Retrieves the value of any data path on any Blender entity."""
+    return default_client.send_command("get_property", {"path": path})
+
 
 @mcp.tool()
-def search_polyhaven_assets(
-    ctx: Context,
-    asset_type: str = "all",
-    categories: str = None
-) -> str:
-    """
-    Search for assets on Polyhaven with optional filtering.
-    
-    Parameters:
-    - asset_type: Type of assets to search for (hdris, textures, models, all)
-    - categories: Optional comma-separated list of categories to filter by
-    
-    Returns a list of matching assets with basic information.
-    """
-    try:
-        blender = get_blender_connection()
-        result = blender.send_command("search_polyhaven_assets", {
-            "asset_type": asset_type,
-            "categories": categories
-        })
-        
-        if "error" in result:
-            return f"Error: {result['error']}"
-        
-        # Format the assets in a more readable way
-        assets = result["assets"]
-        total_count = result["total_count"]
-        returned_count = result["returned_count"]
-        
-        formatted_output = f"Found {total_count} assets"
-        if categories:
-            formatted_output += f" in categories: {categories}"
-        formatted_output += f"\nShowing {returned_count} assets:\n\n"
-        
-        # Sort assets by download count (popularity)
-        sorted_assets = sorted(assets.items(), key=lambda x: x[1].get("download_count", 0), reverse=True)
-        
-        for asset_id, asset_data in sorted_assets:
-            formatted_output += f"- {asset_data.get('name', asset_id)} (ID: {asset_id})\n"
-            formatted_output += f"  Type: {['HDRI', 'Texture', 'Model'][asset_data.get('type', 0)]}\n"
-            formatted_output += f"  Categories: {', '.join(asset_data.get('categories', []))}\n"
-            formatted_output += f"  Downloads: {asset_data.get('download_count', 'Unknown')}\n\n"
-        
-        return formatted_output
-    except Exception as e:
-        logger.error(f"Error searching Polyhaven assets: {str(e)}")
-        return f"Error searching Polyhaven assets: {str(e)}"
+def set_property(path: str, value: Any) -> Dict[str, Any]:
+    """Sets the value of any Blender RNA data path with dynamic type coercion."""
+    return default_client.send_command("set_property", {"path": path, "value": value})
+
 
 @mcp.tool()
-def download_polyhaven_asset(
-    ctx: Context,
-    asset_id: str,
-    asset_type: str,
-    resolution: str = "1k",
-    file_format: str = None
-) -> str:
-    """
-    Download and import a Polyhaven asset into Blender.
-    
-    Parameters:
-    - asset_id: The ID of the asset to download
-    - asset_type: The type of asset (hdris, textures, models)
-    - resolution: The resolution to download (e.g., 1k, 2k, 4k)
-    - file_format: Optional file format (e.g., hdr, exr for HDRIs; jpg, png for textures; gltf, fbx for models)
-    
-    Returns a message indicating success or failure.
-    """
-    try:
-        blender = get_blender_connection()
-        result = blender.send_command("download_polyhaven_asset", {
-            "asset_id": asset_id,
-            "asset_type": asset_type,
-            "resolution": resolution,
-            "file_format": file_format
-        })
-        
-        if "error" in result:
-            return f"Error: {result['error']}"
-        
-        if result.get("success"):
-            message = result.get("message", "Asset downloaded and imported successfully")
-            
-            # Add additional information based on asset type
-            if asset_type == "hdris":
-                return f"{message}. The HDRI has been set as the world environment."
-            elif asset_type == "textures":
-                material_name = result.get("material", "")
-                maps = ", ".join(result.get("maps", []))
-                return f"{message}. Created material '{material_name}' with maps: {maps}."
-            elif asset_type == "models":
-                return f"{message}. The model has been imported into the current scene."
-            else:
-                return message
-        else:
-            return f"Failed to download asset: {result.get('message', 'Unknown error')}"
-    except Exception as e:
-        logger.error(f"Error downloading Polyhaven asset: {str(e)}")
-        return f"Error downloading Polyhaven asset: {str(e)}"
+def eval_expression(expression: str) -> Dict[str, Any]:
+    """Evaluates a single-line Python expression within Blender's global namespace."""
+    return default_client.send_command("eval_expression", {"expression": expression})
+
 
 @mcp.tool()
-def set_texture(
-    ctx: Context,
-    object_name: str,
-    texture_id: str
-) -> str:
-    """
-    Apply a previously downloaded Polyhaven texture to an object.
-    
-    Parameters:
-    - object_name: Name of the object to apply the texture to
-    - texture_id: ID of the Polyhaven texture to apply (must be downloaded first)
-    
-    Returns a message indicating success or failure.
-    """
-    try:
-        # Get the global connection
-        blender = get_blender_connection()
-        result = blender.send_command("set_texture", {
-            "object_name": object_name,
-            "texture_id": texture_id
-        })
-        
-        if "error" in result:
-            return f"Error: {result['error']}"
-        
-        if result.get("success"):
-            material_name = result.get("material", "")
-            maps = ", ".join(result.get("maps", []))
-            
-            # Add detailed material info
-            material_info = result.get("material_info", {})
-            node_count = material_info.get("node_count", 0)
-            has_nodes = material_info.get("has_nodes", False)
-            texture_nodes = material_info.get("texture_nodes", [])
-            
-            output = f"Successfully applied texture '{texture_id}' to {object_name}.\n"
-            output += f"Using material '{material_name}' with maps: {maps}.\n\n"
-            output += f"Material has nodes: {has_nodes}\n"
-            output += f"Total node count: {node_count}\n\n"
-            
-            if texture_nodes:
-                output += "Texture nodes:\n"
-                for node in texture_nodes:
-                    output += f"- {node['name']} using image: {node['image']}\n"
-                    if node['connections']:
-                        output += "  Connections:\n"
-                        for conn in node['connections']:
-                            output += f"    {conn}\n"
-            else:
-                output += "No texture nodes found in the material.\n"
-            
-            return output
-        else:
-            return f"Failed to apply texture: {result.get('message', 'Unknown error')}"
-    except Exception as e:
-        logger.error(f"Error applying texture: {str(e)}")
-        return f"Error applying texture: {str(e)}"
+def exec_script(script: str, use_transaction_rollback: bool = True) -> Dict[str, Any]:
+    """Executes an arbitrary multi-line Python script within Blender with stdout capture and undo rollback."""
+    return default_client.send_command(
+        "exec_script",
+        {"script": script, "use_transaction_rollback": use_transaction_rollback},
+    )
+
+
+# ---------------------------------------------------------------------------
+# 2. Scene, World & Viewport Tools
+# ---------------------------------------------------------------------------
 
 @mcp.tool()
-def get_polyhaven_status(ctx: Context) -> str:
-    """
-    Check if PolyHaven integration is enabled in Blender.
-    Returns a message indicating whether PolyHaven features are available.
-    """
-    try:
-        blender = get_blender_connection()
-        result = blender.send_command("get_polyhaven_status")
-        enabled = result.get("enabled", False)
-        message = result.get("message", "")
-        if enabled:
-            message += "PolyHaven is good at Textures, and has a wider variety of textures than Sketchfab."
-        return message
-    except Exception as e:
-        logger.error(f"Error checking PolyHaven status: {str(e)}")
-        return f"Error checking PolyHaven status: {str(e)}"
+def manage_scene(
+    action: Literal["create", "switch", "delete", "configure", "list", "get_active"] = "list",
+    scene_name: Optional[str] = None,
+    new_name: Optional[str] = None,
+    create_mode: Literal["NEW", "EMPTY", "LINK_COPY", "FULL_COPY", "LINK_OBJECT_DATA"] = "NEW",
+    unit_system: Optional[Literal["METRIC", "IMPERIAL", "NONE"]] = None,
+    unit_length: Optional[str] = None,
+    unit_rotation: Optional[Literal["DEGREES", "RADIANS"]] = None,
+    unit_scale_length: Optional[float] = None,
+    gravity: Optional[List[float]] = None,
+    use_gravity: Optional[bool] = None,
+    active_camera_name: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Manages scene graph, unit systems, gravity vectors, and active camera assignments."""
+    params = {k: v for k, v in locals().items() if v is not None}
+    return default_client.send_command("manage_scene", params)
+
 
 @mcp.tool()
-def get_hyper3d_status(ctx: Context) -> str:
-    """
-    Check if Hyper3D Rodin integration is enabled in Blender.
-    Returns a message indicating whether Hyper3D Rodin features are available.
+def manage_world(
+    mode: Literal["HDRI", "SKY_TEXTURE", "COLOR", "VOLUMETRICS_ONLY", "GET_INFO"] = "GET_INFO",
+    world_name: Optional[str] = None,
+    color: Optional[List[float]] = None,
+    strength: float = 1.0,
+    hdri_filepath: Optional[str] = None,
+    hdri_rotation_z: float = 0.0,
+    sky_type: Literal["NISHITA", "HOSEK_WILKIE", "PREETHAM"] = "NISHITA",
+    sky_sun_intensity: float = 1.0,
+    sky_sun_elevation: Optional[float] = None,
+    sky_sun_rotation: Optional[float] = None,
+    volume_type: Literal["NONE", "SCATTER", "ABSORPTION", "PRINCIPLED"] = "NONE",
+    volume_density: float = 0.01,
+    volume_color: Optional[List[float]] = None,
+    volume_anisotropy: float = 0.0,
+) -> Dict[str, Any]:
+    """Configures World background lighting, HDRIs, Nishita procedural skies, and volumetric fog."""
+    params = {k: v for k, v in locals().items() if v is not None}
+    return default_client.send_command("manage_world", params)
 
-    Don't emphasize the key type in the returned message, but sliently remember it. 
-    """
-    try:
-        blender = get_blender_connection()
-        result = blender.send_command("get_hyper3d_status")
-        enabled = result.get("enabled", False)
-        message = result.get("message", "")
-        if enabled:
-            message += ""
-        return message
-    except Exception as e:
-        logger.error(f"Error checking Hyper3D status: {str(e)}")
-        return f"Error checking Hyper3D status: {str(e)}"
-
-@mcp.tool()
-def get_sketchfab_status(ctx: Context) -> str:
-    """
-    Check if Sketchfab integration is enabled in Blender.
-    Returns a message indicating whether Sketchfab features are available.
-    """
-    try:
-        blender = get_blender_connection()
-        result = blender.send_command("get_sketchfab_status")
-        enabled = result.get("enabled", False)
-        message = result.get("message", "")
-        if enabled:
-            message += "Sketchfab is good at Realistic models, and has a wider variety of models than PolyHaven."        
-        return message
-    except Exception as e:
-        logger.error(f"Error checking Sketchfab status: {str(e)}")
-        return f"Error checking Sketchfab status: {str(e)}"
 
 @mcp.tool()
-def search_sketchfab_models(
-    ctx: Context,
-    query: str,
-    categories: str = None,
-    count: int = 20,
-    downloadable: bool = True
-) -> str:
-    """
-    Search for models on Sketchfab with optional filtering.
-    
-    Parameters:
-    - query: Text to search for
-    - categories: Optional comma-separated list of categories
-    - count: Maximum number of results to return (default 20)
-    - downloadable: Whether to include only downloadable models (default True)
-    
-    Returns a formatted list of matching models.
-    """
-    try:
-        
-        blender = get_blender_connection()
-        logger.info(f"Searching Sketchfab models with query: {query}, categories: {categories}, count: {count}, downloadable: {downloadable}")
-        result = blender.send_command("search_sketchfab_models", {
-            "query": query,
-            "categories": categories,
-            "count": count,
-            "downloadable": downloadable
-        })
-        
-        if "error" in result:
-            logger.error(f"Error from Sketchfab search: {result['error']}")
-            return f"Error: {result['error']}"
-        
-        # Safely get results with fallbacks for None
-        if result is None:
-            logger.error("Received None result from Sketchfab search")
-            return "Error: Received no response from Sketchfab search"
-            
-        # Format the results
-        models = result.get("results", []) or []
-        if not models:
-            return f"No models found matching '{query}'"
-            
-        formatted_output = f"Found {len(models)} models matching '{query}':\n\n"
-        
-        for model in models:
-            if model is None:
-                continue
-                
-            model_name = model.get("name", "Unnamed model")
-            model_uid = model.get("uid", "Unknown ID")
-            formatted_output += f"- {model_name} (UID: {model_uid})\n"
-            
-            # Get user info with safety checks
-            user = model.get("user") or {}
-            username = user.get("username", "Unknown author") if isinstance(user, dict) else "Unknown author"
-            formatted_output += f"  Author: {username}\n"
-            
-            # Get license info with safety checks
-            license_data = model.get("license") or {}
-            license_label = license_data.get("label", "Unknown") if isinstance(license_data, dict) else "Unknown"
-            formatted_output += f"  License: {license_label}\n"
-            
-            # Add face count and downloadable status
-            face_count = model.get("faceCount", "Unknown")
-            is_downloadable = "Yes" if model.get("isDownloadable") else "No"
-            formatted_output += f"  Face count: {face_count}\n"
-            formatted_output += f"  Downloadable: {is_downloadable}\n\n"
-        
-        return formatted_output
-    except Exception as e:
-        logger.error(f"Error searching Sketchfab models: {str(e)}")
-        import traceback
-        logger.error(traceback.format_exc())
-        return f"Error searching Sketchfab models: {str(e)}"
+def manage_viewport(
+    action: Literal["switch_workspace", "set_shading", "set_overlays", "set_clipping_lens", "set_cursor", "lock_view", "get_state"],
+    workspace_name: Optional[str] = None,
+    shading_type: Optional[Literal["WIREFRAME", "SOLID", "MATERIAL", "RENDERED"]] = None,
+    shading_options: Optional[Dict[str, Any]] = None,
+    show_overlays: Optional[bool] = None,
+    overlay_toggles: Optional[Dict[str, bool]] = None,
+    clip_start: Optional[float] = None,
+    clip_end: Optional[float] = None,
+    lens: Optional[float] = None,
+    cursor_location: Optional[List[float]] = None,
+    cursor_rotation_euler: Optional[List[float]] = None,
+    lock_object_name: Optional[str] = None,
+    lock_cursor: Optional[bool] = None,
+) -> Dict[str, Any]:
+    """Controls 3D Viewport workspaces, shading modes, overlays, clipping planes, and 3D cursor."""
+    params = {k: v for k, v in locals().items() if v is not None}
+    return default_client.send_command("manage_viewport", params)
+
 
 @mcp.tool()
-def download_sketchfab_model(
-    ctx: Context,
-    uid: str
-) -> str:
-    """
-    Download and import a Sketchfab model by its UID.
-    
-    Parameters:
-    - uid: The unique identifier of the Sketchfab model
-    
-    Returns a message indicating success or failure.
-    The model must be downloadable and you must have proper access rights.
-    """
-    try:
-        
-        blender = get_blender_connection()
-        logger.info(f"Attempting to download Sketchfab model with UID: {uid}")
-        
-        result = blender.send_command("download_sketchfab_model", {
-            "uid": uid
-        })
-        
-        if result is None:
-            logger.error("Received None result from Sketchfab download")
-            return "Error: Received no response from Sketchfab download request"
-            
-        if "error" in result:
-            logger.error(f"Error from Sketchfab download: {result['error']}")
-            return f"Error: {result['error']}"
-        
-        if result.get("success"):
-            imported_objects = result.get("imported_objects", [])
-            object_names = ", ".join(imported_objects) if imported_objects else "none"
-            return f"Successfully imported model. Created objects: {object_names}"
-        else:
-            return f"Failed to download model: {result.get('message', 'Unknown error')}"
-    except Exception as e:
-        logger.error(f"Error downloading Sketchfab model: {str(e)}")
-        import traceback
-        logger.error(traceback.format_exc())
-        return f"Error downloading Sketchfab model: {str(e)}"
+def manage_camera(
+    action: Literal["create", "update", "set_active", "get_properties", "delete"],
+    camera_name: Optional[str] = None,
+    type: Literal["PERSP", "ORTHO", "PANO"] = "PERSP",
+    focal_length: Optional[float] = None,
+    ortho_scale: Optional[float] = None,
+    sensor_fit: Optional[Literal["AUTO", "HORIZONTAL", "VERTICAL"]] = None,
+    sensor_width: Optional[float] = None,
+    sensor_height: Optional[float] = None,
+    clip_start: Optional[float] = None,
+    clip_end: Optional[float] = None,
+    shift_x: Optional[float] = None,
+    shift_y: Optional[float] = None,
+    dof: Optional[Dict[str, Any]] = None,
+    composition_guides: Optional[Dict[str, bool]] = None,
+) -> Dict[str, Any]:
+    """Creates, configures, or inspects Camera objects with depth of field and guides."""
+    params = {k: v for k, v in locals().items() if v is not None}
+    return default_client.send_command("manage_camera", params)
 
-def _process_bbox(original_bbox: list[float] | list[int] | None) -> list[int] | None:
-    if original_bbox is None:
-        return None
-    if all(isinstance(i, int) for i in original_bbox):
-        return original_bbox
-    if any(i<=0 for i in original_bbox):
-        raise ValueError("Incorrect number range: bbox must be bigger than zero!")
-    return [int(float(i) / max(original_bbox) * 100) for i in original_bbox] if original_bbox else None
 
 @mcp.tool()
-def generate_hyper3d_model_via_text(
-    ctx: Context,
-    text_prompt: str,
-    bbox_condition: list[float]=None
-) -> str:
-    """
-    Generate 3D asset using Hyper3D by giving description of the desired asset, and import the asset into Blender.
-    The 3D asset has built-in materials.
-    The generated model has a normalized size, so re-scaling after generation can be useful.
-    
-    Parameters:
-    - text_prompt: A short description of the desired model in **English**.
-    - bbox_condition: Optional. If given, it has to be a list of floats of length 3. Controls the ratio between [Length, Width, Height] of the model.
+def manage_light(
+    action: Literal["create", "update", "delete", "get_properties", "set_linking"],
+    light_name: Optional[str] = None,
+    type: Literal["POINT", "SUN", "SPOT", "AREA"] = "POINT",
+    energy: Optional[float] = None,
+    color_type: Literal["RGB", "KELVIN"] = "RGB",
+    color_rgb: Optional[List[float]] = None,
+    color_kelvin: Optional[float] = None,
+    radius: Optional[float] = None,
+    area_shape: Optional[Literal["SQUARE", "RECTANGLE", "DISK", "ELLIPSE"]] = None,
+    area_size_x: Optional[float] = None,
+    area_size_y: Optional[float] = None,
+    spot_size: Optional[float] = None,
+    spot_blend: Optional[float] = None,
+    spot_show_cone: Optional[bool] = None,
+    use_shadow: Optional[bool] = None,
+    light_linking: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Manipulates Point, Sun, Spot, and Area light emitters and light linking collections."""
+    params = {k: v for k, v in locals().items() if v is not None}
+    return default_client.send_command("manage_light", params)
 
-    Returns a message indicating success or failure.
-    """
-    try:
-        blender = get_blender_connection()
-        result = blender.send_command("create_rodin_job", {
-            "text_prompt": text_prompt,
-            "images": None,
-            "bbox_condition": _process_bbox(bbox_condition),
-        })
-        succeed = result.get("submit_time", False)
-        if succeed:
-            return json.dumps({
-                "task_uuid": result["uuid"],
-                "subscription_key": result["jobs"]["subscription_key"],
-            })
-        else:
-            return json.dumps(result)
-    except Exception as e:
-        logger.error(f"Error generating Hyper3D task: {str(e)}")
-        return f"Error generating Hyper3D task: {str(e)}"
+
+# ---------------------------------------------------------------------------
+# 3. Objects, Collections & Constraints Tools
+# ---------------------------------------------------------------------------
 
 @mcp.tool()
-def generate_hyper3d_model_via_images(
-    ctx: Context,
-    input_image_paths: list[str]=None,
-    input_image_urls: list[str]=None,
-    bbox_condition: list[float]=None
-) -> str:
-    """
-    Generate 3D asset using Hyper3D by giving images of the wanted asset, and import the generated asset into Blender.
-    The 3D asset has built-in materials.
-    The generated model has a normalized size, so re-scaling after generation can be useful.
-    
-    Parameters:
-    - input_image_paths: The **absolute** paths of input images. Even if only one image is provided, wrap it into a list. Required if Hyper3D Rodin in MAIN_SITE mode.
-    - input_image_urls: The URLs of input images. Even if only one image is provided, wrap it into a list. Required if Hyper3D Rodin in FAL_AI mode.
-    - bbox_condition: Optional. If given, it has to be a list of ints of length 3. Controls the ratio between [Length, Width, Height] of the model.
+def manage_objects(
+    action: Literal["create", "delete", "duplicate", "rename", "set_parent", "clear_parent", "manipulate_parent_inverse"],
+    names: Optional[List[str]] = None,
+    name: Optional[str] = None,
+    new_name: Optional[str] = None,
+    primitive_type: Optional[str] = None,
+    location: Optional[List[float]] = None,
+    rotation: Optional[List[float]] = None,
+    scale: Optional[List[float]] = None,
+    linked: bool = False,
+    delete_hierarchy: bool = False,
+    child_names: Optional[List[str]] = None,
+    parent_name: Optional[str] = None,
+    keep_transform: bool = True,
+    matrix_parent_inverse: Optional[List[List[float]]] = None,
+) -> Dict[str, Any]:
+    """Creates, duplicates, deletes, renames, and parents objects."""
+    params = {k: v for k, v in locals().items() if v is not None}
+    return default_client.send_command("manage_objects", params)
 
-    Only one of {input_image_paths, input_image_urls} should be given at a time, depending on the Hyper3D Rodin's current mode.
-    Returns a message indicating success or failure.
-    """
-    if input_image_paths is not None and input_image_urls is not None:
-        return f"Error: Conflict parameters given!"
-    if input_image_paths is None and input_image_urls is None:
-        return f"Error: No image given!"
-    if input_image_paths is not None:
-        if not all(os.path.exists(i) for i in input_image_paths):
-            return "Error: not all image paths are valid!"
-        images = []
-        for path in input_image_paths:
-            with open(path, "rb") as f:
-                images.append(
-                    (Path(path).suffix, base64.b64encode(f.read()).decode("ascii"))
-                )
-    elif input_image_urls is not None:
-        if not all(urlparse(i) for i in input_image_paths):
-            return "Error: not all image URLs are valid!"
-        images = input_image_urls.copy()
-    try:
-        blender = get_blender_connection()
-        result = blender.send_command("create_rodin_job", {
-            "text_prompt": None,
-            "images": images,
-            "bbox_condition": _process_bbox(bbox_condition),
-        })
-        succeed = result.get("submit_time", False)
-        if succeed:
-            return json.dumps({
-                "task_uuid": result["uuid"],
-                "subscription_key": result["jobs"]["subscription_key"],
-            })
-        else:
-            return json.dumps(result)
-    except Exception as e:
-        logger.error(f"Error generating Hyper3D task: {str(e)}")
-        return f"Error generating Hyper3D task: {str(e)}"
 
 @mcp.tool()
-def poll_rodin_job_status(
-    ctx: Context,
-    subscription_key: str=None,
-    request_id: str=None,
-):
-    """
-    Check if the Hyper3D Rodin generation task is completed.
-
-    For Hyper3D Rodin mode MAIN_SITE:
-        Parameters:
-        - subscription_key: The subscription_key given in the generate model step.
-
-        Returns a list of status. The task is done if all status are "Done".
-        If "Failed" showed up, the generating process failed.
-        This is a polling API, so only proceed if the status are finally determined ("Done" or "Canceled").
-
-    For Hyper3D Rodin mode FAL_AI:
-        Parameters:
-        - request_id: The request_id given in the generate model step.
-
-        Returns the generation task status. The task is done if status is "COMPLETED".
-        The task is in progress if status is "IN_PROGRESS".
-        If status other than "COMPLETED", "IN_PROGRESS", "IN_QUEUE" showed up, the generating process might be failed.
-        This is a polling API, so only proceed if the status are finally determined ("COMPLETED" or some failed state).
-    """
-    try:
-        blender = get_blender_connection()
-        kwargs = {}
-        if subscription_key:
-            kwargs = {
-                "subscription_key": subscription_key,
-            }
-        elif request_id:
-            kwargs = {
-                "request_id": request_id,
-            }
-        result = blender.send_command("poll_rodin_job_status", kwargs)
-        return result
-    except Exception as e:
-        logger.error(f"Error generating Hyper3D task: {str(e)}")
-        return f"Error generating Hyper3D task: {str(e)}"
-
-@mcp.tool()
-def import_generated_asset(
-    ctx: Context,
+def manage_collections(
+    action: Literal["create", "delete", "move", "rename", "link_objects", "unlink_objects", "set_visibility"],
     name: str,
-    task_uuid: str=None,
-    request_id: str=None,
-):
-    """
-    Import the asset generated by Hyper3D Rodin after the generation task is completed.
+    new_name: Optional[str] = None,
+    parent_collection: Optional[str] = None,
+    object_names: Optional[List[str]] = None,
+    unlink_from_all_others: bool = False,
+    hide_viewport: Optional[bool] = None,
+    hide_render: Optional[bool] = None,
+    hide_select: Optional[bool] = None,
+    color_tag: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Manages scene collections, organization, object links, and visibility."""
+    params = {k: v for k, v in locals().items() if v is not None}
+    return default_client.send_command("manage_collections", params)
 
-    Parameters:
-    - name: The name of the object in scene
-    - task_uuid: For Hyper3D Rodin mode MAIN_SITE: The task_uuid given in the generate model step.
-    - request_id: For Hyper3D Rodin mode FAL_AI: The request_id given in the generate model step.
 
-    Only give one of {task_uuid, request_id} based on the Hyper3D Rodin Mode!
-    Return if the asset has been imported successfully.
-    """
-    try:
-        blender = get_blender_connection()
-        kwargs = {
-            "name": name
-        }
-        if task_uuid:
-            kwargs["task_uuid"] = task_uuid
-        elif request_id:
-            kwargs["request_id"] = request_id
-        result = blender.send_command("import_generated_asset", kwargs)
-        return result
-    except Exception as e:
-        logger.error(f"Error generating Hyper3D task: {str(e)}")
-        return f"Error generating Hyper3D task: {str(e)}"
+@mcp.tool()
+def transform_object(
+    name: str,
+    space: Literal["GLOBAL", "LOCAL", "PARENT"] = "GLOBAL",
+    location: Optional[List[float]] = None,
+    relative_location: bool = False,
+    rotation_mode: Literal["XYZ", "XZY", "YXZ", "YZX", "ZXY", "ZYX", "QUATERNION", "AXIS_ANGLE"] = "XYZ",
+    rotation: Optional[List[float]] = None,
+    rotation_in_degrees: bool = False,
+    relative_rotation: bool = False,
+    scale: Optional[List[float]] = None,
+    relative_scale: bool = False,
+    delta: bool = False,
+) -> Dict[str, Any]:
+    """Transforms objects in global, local, or parent coordinate spaces."""
+    params = {k: v for k, v in locals().items() if v is not None}
+    return default_client.send_command("transform_object", params)
 
-@mcp.prompt()
-def asset_creation_strategy() -> str:
-    """Defines the preferred strategy for creating assets in Blender"""
-    return """When creating 3D content in Blender, always start by checking if integrations are available:
 
-    0. Before anything, always check the scene from get_scene_info()
-    1. First use the following tools to verify if the following integrations are enabled:
-        1. PolyHaven
-            Use get_polyhaven_status() to verify its status
-            If PolyHaven is enabled:
-            - For objects/models: Use download_polyhaven_asset() with asset_type="models"
-            - For materials/textures: Use download_polyhaven_asset() with asset_type="textures"
-            - For environment lighting: Use download_polyhaven_asset() with asset_type="hdris"
-        2. Sketchfab
-            Sketchfab is good at Realistic models, and has a wider variety of models than PolyHaven.
-            Use get_sketchfab_status() to verify its status
-            If Sketchfab is enabled:
-            - For objects/models: First search using search_sketchfab_models() with your query
-            - Then download specific models using download_sketchfab_model() with the UID
-            - Note that only downloadable models can be accessed, and API key must be properly configured
-            - Sketchfab has a wider variety of models than PolyHaven, especially for specific subjects
-        3. Hyper3D(Rodin)
-            Hyper3D Rodin is good at generating 3D models for single item.
-            So don't try to:
-            1. Generate the whole scene with one shot
-            2. Generate ground using Hyper3D
-            3. Generate parts of the items separately and put them together afterwards
+@mcp.tool()
+def manage_constraints(
+    action: Literal["add", "update", "remove", "get", "reorder"],
+    object_name: str,
+    bone_name: Optional[str] = None,
+    constraint_name: Optional[str] = None,
+    constraint_type: Optional[str] = None,
+    config: Optional[Dict[str, Any]] = None,
+    new_index: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Adds, updates, removes, or reorders object and bone constraints."""
+    params = {k: v for k, v in locals().items() if v is not None}
+    return default_client.send_command("manage_constraints", params)
 
-            Use get_hyper3d_status() to verify its status
-            If Hyper3D is enabled:
-            - For objects/models, do the following steps:
-                1. Create the model generation task
-                    - Use generate_hyper3d_model_via_images() if image(s) is/are given
-                    - Use generate_hyper3d_model_via_text() if generating 3D asset using text prompt
-                    If key type is free_trial and insufficient balance error returned, tell the user that the free trial key can only generated limited models everyday, they can choose to:
-                    - Wait for another day and try again
-                    - Go to hyper3d.ai to find out how to get their own API key
-                    - Go to fal.ai to get their own private API key
-                2. Poll the status
-                    - Use poll_rodin_job_status() to check if the generation task has completed or failed
-                3. Import the asset
-                    - Use import_generated_asset() to import the generated GLB model the asset
-                4. After importing the asset, ALWAYS check the world_bounding_box of the imported mesh, and adjust the mesh's location and size
-                    Adjust the imported mesh's location, scale, rotation, so that the mesh is on the right spot.
 
-                You can reuse assets previous generated by running python code to duplicate the object, without creating another generation task.
+# ---------------------------------------------------------------------------
+# 4. Mesh, BMesh & Geometry Nodes Tools
+# ---------------------------------------------------------------------------
 
-    3. Always check the world_bounding_box for each item so that:
-        - Ensure that all objects that should not be clipping are not clipping.
-        - Items have right spatial relationship.
-    
-    4. Recommended asset source priority:
-        - For specific existing objects: First try Sketchfab, then PolyHaven
-        - For generic objects/furniture: First try PolyHaven, then Sketchfab
-        - For custom or unique items not available in libraries: Use Hyper3D Rodin
-        - For environment lighting: Use PolyHaven HDRIs
-        - For materials/textures: Use PolyHaven textures
+@mcp.tool()
+def create_primitive(
+    primitive_type: Literal[
+        "CUBE", "UV_SPHERE", "ICO_SPHERE", "CYLINDER", "CONE", "TORUS", "GRID", "PLANE", "CIRCLE", "MONKEY", "EMPTY"
+    ] = "CUBE",
+    name: Optional[str] = None,
+    location: Optional[List[float]] = None,
+    rotation: Optional[List[float]] = None,
+    scale: Optional[List[float]] = None,
+    size: float = 2.0,
+    radius: float = 1.0,
+    depth: float = 2.0,
+    segments: int = 32,
+    ring_count: int = 16,
+    subdivisions: int = 3,
+) -> Dict[str, Any]:
+    """Generates parametric mesh primitives (Cube, Sphere, Cylinder, Torus, Monkey, etc.)."""
+    params = {k: v for k, v in locals().items() if v is not None}
+    return default_client.send_command("create_primitive", params)
 
-    Only fall back to scripting when:
-    - PolyHaven, Sketchfab, and Hyper3D are all disabled
-    - A simple primitive is explicitly requested
-    - No suitable asset exists in any of the libraries
-    - Hyper3D Rodin failed to generate the desired asset
-    - The task specifically requires a basic material/color
-    """
 
-# Main execution
+@mcp.tool()
+def manipulate_mesh(
+    object_name: str,
+    operation: Literal[
+        "EXTRUDE_FACES", "BEVEL", "INSET_FACES", "SUBDIVIDE", "MERGE_VERTICES",
+        "BRIDGE_EDGE_LOOPS", "DISSOLVE", "BOOLEAN", "RECALCULATE_NORMALS",
+        "SET_SHADING", "CREATE_ELEMENTS", "DELETE_ELEMENTS"
+    ],
+    vertex_indices: Optional[List[int]] = None,
+    edge_indices: Optional[List[int]] = None,
+    face_indices: Optional[List[int]] = None,
+    translation: Optional[List[float]] = None,
+    offset: float = 0.2,
+    thickness: float = 0.0,
+    segments: int = 2,
+    profile: float = 0.5,
+    merge_type: Literal["DISTANCE", "CENTER", "COLLAPSE"] = "DISTANCE",
+    boolean_target: Optional[str] = None,
+    boolean_operation: Literal["DIFFERENCE", "UNION", "INTERSECT"] = "DIFFERENCE",
+    shading_mode: Optional[Literal["SMOOTH", "FLAT", "AUTO_SMOOTH"]] = None,
+) -> Dict[str, Any]:
+    """Executes high-precision bmesh modeling operations, extrusions, insets, and booleans."""
+    params = {k: v for k, v in locals().items() if v is not None}
+    return default_client.send_command("manipulate_mesh", params)
+
+
+@mcp.tool()
+def create_curve(
+    name: str = "Curve",
+    curve_type: Literal["BEZIER", "NURBS_CURVE", "PATH"] = "BEZIER",
+    points: Optional[List[Dict[str, Any]]] = None,
+    is_cyclic: bool = False,
+    bevel_depth: float = 0.0,
+    extrude: float = 0.0,
+) -> Dict[str, Any]:
+    """Generates Bezier, NURBS, or Path curves with programmable control points and bevels."""
+    params = {k: v for k, v in locals().items() if v is not None}
+    return default_client.send_command("create_curve", params)
+
+
+@mcp.tool()
+def create_text_3d(
+    body: str,
+    name: str = "Text3D",
+    location: Optional[List[float]] = None,
+    size: float = 1.0,
+    extrude: float = 0.05,
+    bevel_depth: float = 0.01,
+) -> Dict[str, Any]:
+    """Creates 3D extruded and bevelled typography."""
+    params = {k: v for k, v in locals().items() if v is not None}
+    return default_client.send_command("create_text", params)
+
+
+@mcp.tool()
+def manage_geometry_nodes(
+    object_name: str,
+    modifier_name: str = "GeometryNodes",
+    tree_name: Optional[str] = None,
+    nodes: Optional[List[Dict[str, Any]]] = None,
+    links: Optional[List[Dict[str, Any]]] = None,
+) -> Dict[str, Any]:
+    """Constructs or modifies procedural Geometry Nodes graphs on target objects."""
+    params = {k: v for k, v in locals().items() if v is not None}
+    return default_client.send_command("manage_geometry_nodes", params)
+
+
+# ---------------------------------------------------------------------------
+# 5. Materials, Shading & UV Tools
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def manage_materials(
+    action: Literal["create", "delete", "duplicate", "assign", "set_use_nodes"],
+    material_name: Optional[str] = None,
+    new_name: Optional[str] = None,
+    object_name: Optional[str] = None,
+    slot_index: Optional[int] = None,
+    face_indices: Optional[List[int]] = None,
+    use_nodes: bool = True,
+) -> Dict[str, Any]:
+    """Creates, assigns, duplicates, and manages material slots on objects."""
+    params = {k: v for k, v in locals().items() if v is not None}
+    return default_client.send_command("manage_materials", params)
+
+
+@mcp.tool()
+def inspect_shader_tree(material_name: str, group_name: Optional[str] = None) -> Dict[str, Any]:
+    """Inspects all nodes, sockets, and connections within a material's shader tree."""
+    return default_client.send_command("inspect_shader_tree", {"material_name": material_name, "group_name": group_name})
+
+
+@mcp.tool()
+def manage_shader_node(
+    action: Literal["create", "delete", "move"],
+    material_name: str,
+    node_type: Optional[str] = None,
+    node_name: Optional[str] = None,
+    location: Optional[List[float]] = None,
+    group_name: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Creates, moves, or deletes shader nodes in a material."""
+    params = {k: v for k, v in locals().items() if v is not None}
+    return default_client.send_command("manage_shader_node", params)
+
+
+@mcp.tool()
+def manage_shader_links(
+    material_name: str,
+    from_node: str,
+    from_socket: Union[str, int],
+    to_node: str,
+    to_socket: Union[str, int],
+    action: Literal["link", "unlink"] = "link",
+    group_name: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Wires or removes socket connections between shader nodes."""
+    params = {k: v for k, v in locals().items() if v is not None}
+    return default_client.send_command("manage_shader_links", params)
+
+
+@mcp.tool()
+def set_socket_value(
+    material_name: str,
+    node_name: str,
+    socket_identifier: Union[str, int],
+    value: Any,
+    group_name: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Sets the default value of an input socket on a shader node (Colors, Vectors, Floats)."""
+    params = {k: v for k, v in locals().items() if v is not None}
+    return default_client.send_command("set_socket_value", params)
+
+
+@mcp.tool()
+def setup_procedural_texture(
+    material_name: str,
+    texture_type: Literal["noise", "voronoi", "wave", "brick", "checker", "gradient", "magic"] = "noise",
+    coord_type: Literal["Generated", "UV", "Object", "Camera", "Window", "Reflection"] = "UV",
+    location: Optional[List[float]] = None,
+    rotation: Optional[List[float]] = None,
+    scale: Optional[List[float]] = None,
+    connect_to_principled: bool = True,
+) -> Dict[str, Any]:
+    """Constructs an automated TexCoord + Mapping + Procedural Texture shader pipeline."""
+    params = {k: v for k, v in locals().items() if v is not None}
+    return default_client.send_command("setup_procedural_texture", params)
+
+
+@mcp.tool()
+def assign_image_texture(
+    material_name: str,
+    image_path: str,
+    pack_image: bool = False,
+    target_socket: str = "Base Color",
+) -> Dict[str, Any]:
+    """Loads an external image asset, assigns to an Image Texture node, and links to Principled BSDF."""
+    params = {k: v for k, v in locals().items() if v is not None}
+    return default_client.send_command("assign_image_texture", params)
+
+
+@mcp.tool()
+def perform_uv_unwrap(
+    object_name: str,
+    method: Literal["smart_project", "unwrap", "cube_project", "cylinder_project", "sphere_project", "lightmap_pack"] = "smart_project",
+    angle_limit: float = 66.0,
+    island_margin: float = 0.02,
+) -> Dict[str, Any]:
+    """Executes UV unwrapping algorithms (Smart UV Project, Seam-based Unwrap, Projections)."""
+    params = {k: v for k, v in locals().items() if v is not None}
+    return default_client.send_command("perform_uv_unwrap", params)
+
+
+# ---------------------------------------------------------------------------
+# 6. Modifiers, Physics & Particle Tools
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def manage_modifier(
+    object_name: str,
+    action: Literal["add", "remove", "apply", "reorder", "configure", "list"],
+    modifier_name: Optional[str] = None,
+    modifier_type: Optional[str] = None,
+    new_index: Optional[int] = None,
+    properties: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Manages all Blender modifiers across Generate, Deform, and Modify categories."""
+    params = {k: v for k, v in locals().items() if v is not None}
+    return default_client.send_command("manage_modifier", params)
+
+
+@mcp.tool()
+def setup_physics_simulation(
+    object_name: str,
+    physics_type: Literal["RIGID_BODY", "CLOTH", "COLLISION", "SOFT_BODY", "DYNAMIC_PAINT", "FLUID", "FORCE_FIELD"],
+    action: Literal["enable", "disable", "configure", "bake"] = "enable",
+    rigid_body: Optional[Dict[str, Any]] = None,
+    cloth: Optional[Dict[str, Any]] = None,
+    soft_body: Optional[Dict[str, Any]] = None,
+    fluid: Optional[Dict[str, Any]] = None,
+    force_field: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Configures physics simulations: Rigid Body, Cloth presets, Fluid, Collision, and Force Fields."""
+    params = {k: v for k, v in locals().items() if v is not None}
+    return default_client.send_command("setup_physics_simulation", params)
+
+
+@mcp.tool()
+def manage_particle_system(
+    object_name: str,
+    action: Literal["add", "remove", "configure", "list"],
+    system_name: Optional[str] = None,
+    config: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Creates and parameterizes Emitter and Hair particle systems."""
+    params = {k: v for k, v in locals().items() if v is not None}
+    return default_client.send_command("manage_particle_system", params)
+
+
+# ---------------------------------------------------------------------------
+# 7. Animation, Timeline & Rigging Tools
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def timeline_control(
+    frame_start: Optional[int] = None,
+    frame_end: Optional[int] = None,
+    current_frame: Optional[int] = None,
+    fps: Optional[int] = None,
+    fps_base: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Controls playback range, frame rates, and active playhead frame."""
+    params = {k: v for k, v in locals().items() if v is not None}
+    return default_client.send_command("timeline_control", params)
+
+
+@mcp.tool()
+def insert_keyframe(
+    target_name: str,
+    data_path: str,
+    target_type: Literal["OBJECT", "MATERIAL", "WORLD", "POSE_BONE", "NODE_TREE"] = "OBJECT",
+    array_index: int = -1,
+    frame: Optional[float] = None,
+    value: Optional[Any] = None,
+    group: Optional[str] = None,
+    interpolation: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Inserts keyframes across any data path with optional values and interpolation."""
+    params = {k: v for k, v in locals().items() if v is not None}
+    return default_client.send_command("insert_keyframe", params)
+
+
+@mcp.tool()
+def delete_keyframe(
+    target_name: str,
+    data_path: str,
+    target_type: Literal["OBJECT", "MATERIAL", "WORLD", "POSE_BONE", "NODE_TREE"] = "OBJECT",
+    array_index: int = -1,
+    frame: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Deletes keyframes on target properties."""
+    params = {k: v for k, v in locals().items() if v is not None}
+    return default_client.send_command("delete_keyframe", params)
+
+
+@mcp.tool()
+def list_fcurves(target_name: str, target_type: Literal["OBJECT", "MATERIAL", "WORLD", "POSE_BONE"] = "OBJECT") -> Dict[str, Any]:
+    """Lists animated F-Curves and keyframe counts on an entity."""
+    return default_client.send_command("list_fcurves", {"target_name": target_name, "target_type": target_type})
+
+
+@mcp.tool()
+def manage_driver(
+    target_name: str,
+    data_path: str,
+    action: Literal["add_driver", "remove_driver"] = "add_driver",
+    target_type: Literal["OBJECT", "MATERIAL", "WORLD", "POSE_BONE", "NODE_TREE"] = "OBJECT",
+    array_index: int = -1,
+    driver_expression: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Adds or removes mathematical expression drivers on animatable channels."""
+    params = {k: v for k, v in locals().items() if v is not None}
+    return default_client.send_command("manage_driver", params)
+
+
+@mcp.tool()
+def manage_armature(
+    armature_name: str,
+    action: Literal["create_armature", "pose_bone", "add_constraint"] = "create_armature",
+    location: Optional[List[float]] = None,
+    rotation_euler: Optional[List[float]] = None,
+    bones: Optional[List[Dict[str, Any]]] = None,
+    bone_name: Optional[str] = None,
+    bone_transforms: Optional[Dict[str, Any]] = None,
+    constraint_type: Optional[str] = None,
+    constraint_config: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Builds armature bone hierarchies, adjusts pose bone transforms, and configures IK."""
+    params = {k: v for k, v in locals().items() if v is not None}
+    return default_client.send_command("manage_armature", params)
+
+
+# ---------------------------------------------------------------------------
+# 8. Render Engine, Compositor & Capture Tools
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def configure_render_engine(
+    engine: Literal["CYCLES", "BLENDER_EEVEE_NEXT", "BLENDER_EEVEE", "BLENDER_WORKBENCH"] = "CYCLES",
+    device_type: Literal["CPU", "GPU"] = "GPU",
+    render_samples: int = 128,
+    viewport_samples: int = 32,
+    use_noise_threshold: bool = True,
+    noise_threshold: float = 0.01,
+    bounces: Optional[Dict[str, int]] = None,
+) -> Dict[str, Any]:
+    """Configures render engine (Cycles/EEVEE/Workbench), GPU compute device, and sampling limits."""
+    params = {k: v for k, v in locals().items() if v is not None}
+    return default_client.send_command("configure_render_engine", params)
+
+
+@mcp.tool()
+def configure_output_and_passes(
+    resolution_x: int = 1920,
+    resolution_y: int = 1080,
+    resolution_percentage: int = 100,
+    fps: int = 24,
+    output_filepath: str = "//render_output/render_",
+    file_format: str = "PNG",
+    passes: Optional[Dict[str, bool]] = None,
+) -> Dict[str, Any]:
+    """Sets image dimensions, framerate, file formats, and View Layer passes."""
+    params = {k: v for k, v in locals().items() if v is not None}
+    return default_client.send_command("configure_output_and_passes", params)
+
+
+@mcp.tool()
+def configure_color_management(
+    display_device: str = "sRGB",
+    view_transform: str = "AgX",
+    look: str = "None",
+    exposure: float = 0.0,
+    gamma: float = 1.0,
+) -> Dict[str, Any]:
+    """Configures OCIO Color Management, View Transforms (AgX/Filmic), looks, and exposures."""
+    params = {k: v for k, v in locals().items() if v is not None}
+    return default_client.send_command("configure_color_management", params)
+
+
+@mcp.tool()
+def manage_compositor_tree(
+    action: Literal["inspect", "enable", "clear", "add_node", "remove_node", "link", "set_socket_value"],
+    node_type: Optional[str] = None,
+    node_name: Optional[str] = None,
+    location: Optional[List[float]] = None,
+    from_node: Optional[str] = None,
+    from_socket: Optional[str] = None,
+    to_node: Optional[str] = None,
+    to_socket: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Constructs and manages the Compositor node graph."""
+    params = {k: v for k, v in locals().items() if v is not None}
+    return default_client.send_command("manage_compositor_tree", params)
+
+
+@mcp.tool()
+def execute_capture_or_render(
+    mode: Literal["STILL", "ANIMATION", "VIEWPORT_SCREENSHOT"] = "STILL",
+    camera_name: Optional[str] = None,
+    frame_start: Optional[int] = None,
+    frame_end: Optional[int] = None,
+    shading_mode: Literal["WIREFRAME", "SOLID", "MATERIAL", "RENDERED"] = "RENDERED",
+    show_overlays: bool = False,
+    output_path: Optional[str] = None,
+    return_base64: bool = True,
+) -> Dict[str, Any]:
+    """Triggers offline frame renders, multi-frame animations, or instant OpenGL viewport captures."""
+    params = {k: v for k, v in locals().items() if v is not None}
+    return default_client.send_command("execute_capture_or_render", params)
+
+
+# ---------------------------------------------------------------------------
+# 9. Preferences, Addons & Universal I/O Tools
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+def manage_user_preferences(
+    category: Literal["system", "interface", "view", "filepaths", "keymap", "experimental", "all"] = "system",
+    action: Literal["get", "set"] = "get",
+    settings: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Inspects or modifies Blender User Preferences across all categories."""
+    params = {k: v for k, v in locals().items() if v is not None}
+    return default_client.send_command("manage_user_preferences", params)
+
+
+@mcp.tool()
+def manage_addon(
+    module_name: str,
+    action: Literal["enable", "disable", "install", "check_status"],
+    filepath: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Checks, enables, disables, or installs Blender addons."""
+    params = {k: v for k, v in locals().items() if v is not None}
+    return default_client.send_command("manage_addon", params)
+
+
+@mcp.tool()
+def manage_external_data(
+    action: Literal["pack_all", "unpack_all", "find_missing", "make_paths_relative", "make_paths_absolute"],
+    directory: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Packs or unpacks external files, locates missing assets, and manages path relations."""
+    params = {k: v for k, v in locals().items() if v is not None}
+    return default_client.send_command("manage_external_data", params)
+
+
+@mcp.tool()
+def universal_import_export(
+    format: Literal["fbx", "obj", "gltf", "glb", "usd", "abc", "stl", "ply", "svg", "bvh", "dae"],
+    mode: Literal["import", "export"],
+    filepath: str,
+    options: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Universal import/export dispatcher for FBX, OBJ, GLTF, USD, Alembic, STL, PLY, SVG, BVH, and DAE."""
+    params = {
+        "format": format.lower(),
+        "mode": mode.lower(),
+        "filepath": filepath,
+        "options": options or {},
+    }
+    return default_client.send_command("universal_import_export", params)
+
 
 def main():
-    """Run the MCP server"""
+    """Main entry point for running the Blender MCP server."""
     mcp.run()
+
 
 if __name__ == "__main__":
     main()
