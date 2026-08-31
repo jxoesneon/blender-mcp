@@ -24,6 +24,29 @@ class ScriptSandboxInput(BaseModel):
     script: str = Field(..., description="Python script body to execute")
     use_transaction_rollback: bool = Field(True, description="Whether to wrap in undo step")
 
+class UndoManageInput(BaseModel):
+    action: Literal["undo", "redo", "undo_history", "push_undo_step"] = Field(..., description="Undo/redo action to perform")
+    steps: int = Field(1, description="Number of steps (or history item index for undo_history)")
+
+class ObjectInfoInput(BaseModel):
+    object_name: str = Field(..., description="Name of the object to introspect")
+
+class ListPropertiesInput(BaseModel):
+    path: str = Field(..., description="Data path to introspect (e.g. \"bpy.context.active_object\")")
+    include_readonly: bool = Field(False, description="Whether to include read-only properties")
+
+class SimulateInputInput(BaseModel):
+    event_type: Literal["MOUSEMOVE", "LEFTMOUSE", "RIGHTMOUSE", "WHEELUPMOUSE", "WHEELDOWNMOUSE", "KEYBOARD"] = Field(..., description="Type of input event to simulate")
+    mouse_x: Optional[int] = None
+    mouse_y: Optional[int] = None
+    key: Optional[str] = None
+    value: Optional[Literal["PRESS", "RELEASE", "CLICK"]] = "PRESS"
+    region_name: str = "WINDOW"
+
+class ScriptJSONInput(BaseModel):
+    script: str = Field(..., description="Python script body that must end with a `result` variable")
+    use_transaction_rollback: bool = Field(True, description="Whether to wrap in undo step")
+
 class SceneManageInput(BaseModel):
     action: Literal["create", "switch", "delete", "configure", "list", "get_active"] = "list"
     scene_name: Optional[str] = None
@@ -54,7 +77,7 @@ class WorldManageInput(BaseModel):
     volume_anisotropy: float = 0.0
 
 class ViewportManageInput(BaseModel):
-    action: Literal["switch_workspace", "set_shading", "set_overlays", "set_clipping_lens", "set_cursor", "lock_view", "get_state"]
+    action: Literal["switch_workspace", "set_shading", "set_overlays", "set_clipping_lens", "set_cursor", "lock_view", "get_state", "frame_to_selected", "frame_all", "orbit", "pan", "zoom", "set_camera_view"]
     workspace_name: Optional[str] = None
     shading_type: Optional[Literal["WIREFRAME", "SOLID", "MATERIAL", "RENDERED"]] = None
     shading_options: Optional[Dict[str, Any]] = None
@@ -67,6 +90,14 @@ class ViewportManageInput(BaseModel):
     cursor_rotation_euler: Optional[List[float]] = None
     lock_object_name: Optional[str] = None
     lock_cursor: Optional[bool] = None
+    delta: Optional[int] = None
+    use_active_camera: Optional[bool] = None
+
+class ViewLayerManageInput(BaseModel):
+    action: Literal["list", "add", "remove", "set_active", "configure"] = "list"
+    layer_name: Optional[str] = None
+    new_name: Optional[str] = None
+    settings: Optional[Dict[str, Any]] = None
 
 class CameraManageInput(BaseModel):
     action: Literal["create", "update", "set_active", "get_properties", "delete"]
@@ -101,6 +132,14 @@ class LightManageInput(BaseModel):
     spot_show_cone: Optional[bool] = None
     use_shadow: Optional[bool] = None
     light_linking: Optional[Dict[str, Any]] = None
+
+class LightprobeManageInput(BaseModel):
+    action: Literal["create", "delete", "list", "configure"] = "list"
+    lightprobe_name: Optional[str] = None
+    probe_type: Literal["CUBEMAP", "PLANAR", "GRID"] = "CUBEMAP"
+    location: Optional[List[float]] = None
+    rotation: Optional[List[float]] = None
+    properties: Optional[Dict[str, Any]] = None
 
 class ObjectHierarchyInput(BaseModel):
     action: Literal["create", "delete", "duplicate", "rename", "set_parent", "clear_parent", "manipulate_parent_inverse"]
@@ -152,6 +191,22 @@ class ConstraintManageInput(BaseModel):
     config: Optional[Dict[str, Any]] = None
     new_index: Optional[int] = None
 
+class VertexGroupManageInput(BaseModel):
+    object_name: str
+    action: Literal["list", "add", "remove", "assign", "remove_from", "set_active", "rename"]
+    group_name: Optional[str] = None
+    new_name: Optional[str] = None
+    vertex_indices: Optional[List[int]] = None
+    weight: float = 1.0
+
+class ShapeKeyManageInput(BaseModel):
+    object_name: str
+    action: Literal["list", "add", "remove", "set_value", "set_active", "rename"]
+    key_name: Optional[str] = None
+    new_name: Optional[str] = None
+    value: Optional[float] = None
+    shape_key_type: Optional[Literal["BASIS", "FROM_MIX"]] = "BASIS"
+
 class MeshPrimitiveInput(BaseModel):
     primitive_type: Literal["CUBE", "UV_SPHERE", "ICO_SPHERE", "CYLINDER", "CONE", "TORUS", "GRID", "PLANE", "CIRCLE", "MONKEY", "EMPTY"] = "CUBE"
     name: Optional[str] = None
@@ -170,15 +225,19 @@ class MeshManipulateInput(BaseModel):
     operation: Literal[
         "EXTRUDE_FACES", "BEVEL", "INSET_FACES", "SUBDIVIDE", "MERGE_VERTICES",
         "BRIDGE_EDGE_LOOPS", "DISSOLVE", "BOOLEAN", "RECALCULATE_NORMALS",
-        "SET_SHADING", "CREATE_ELEMENTS", "DELETE_ELEMENTS"
+        "SET_SHADING", "CREATE_ELEMENTS", "DELETE_ELEMENTS",
+        "KNIFE", "LOOP_CUT", "FILL", "GRID_FILL", "POKE", "EDGE_SPLIT",
+        "SUBDIVIDE_EDGE", "BRIDGE_FACES"
     ]
     vertex_indices: Optional[List[int]] = None
+    vertex_pairs: Optional[List[List[int]]] = None
     edge_indices: Optional[List[int]] = None
     face_indices: Optional[List[int]] = None
     translation: Optional[List[float]] = None
     offset: float = 0.2
     thickness: float = 0.0
     segments: int = 2
+    cuts: Optional[int] = None
     profile: float = 0.5
     merge_type: Literal["DISTANCE", "CENTER", "COLLAPSE"] = "DISTANCE"
     boolean_target: Optional[str] = None
@@ -189,8 +248,16 @@ class GeometryNodesInput(BaseModel):
     object_name: str
     modifier_name: str = "GeometryNodes"
     tree_name: Optional[str] = None
+    action: Literal["build", "inspect", "set_socket_value", "add_group_input", "add_group_output", "set_modifier_input"] = "build"
     nodes: Optional[List[Dict[str, Any]]] = None
     links: Optional[List[Dict[str, Any]]] = None
+    node_name: Optional[str] = None
+    socket_name: Optional[str] = None
+    socket_identifier: Optional[str] = None
+    socket_direction: Optional[Literal["input", "output"]] = "input"
+    value: Optional[Any] = None
+    input_name: Optional[str] = None
+    location: Optional[List[float]] = None
 
 class MaterialManageInput(BaseModel):
     action: Literal["create", "delete", "duplicate", "assign", "set_use_nodes"]
@@ -209,11 +276,26 @@ class ShaderNodeManageInput(BaseModel):
     location: Optional[List[float]] = None
     group_name: Optional[str] = None
 
+class ColorAttributeManageInput(BaseModel):
+    object_name: str
+    action: Literal["list", "add", "remove", "set_active", "set_values"] = "list"
+    attribute_name: Optional[str] = None
+    domain: Optional[Literal["POINT", "CORNER"]] = "POINT"
+    data_type: Optional[Literal["FLOAT_COLOR", "BYTE_COLOR"]] = "FLOAT_COLOR"
+    vertex_indices: Optional[List[int]] = None
+    color: Optional[List[float]] = None
+
 class UVUnwrapInput(BaseModel):
     object_name: str
     method: Literal["smart_project", "unwrap", "cube_project", "cylinder_project", "sphere_project", "lightmap_pack"] = "smart_project"
     angle_limit: float = 66.0
     island_margin: float = 0.02
+
+class UVLayerManageInput(BaseModel):
+    object_name: str
+    action: Literal["list", "add", "remove", "set_active", "rename", "stitch"] = "list"
+    uv_name: Optional[str] = None
+    new_name: Optional[str] = None
 
 class ModifierManageInput(BaseModel):
     object_name: str
@@ -226,12 +308,15 @@ class ModifierManageInput(BaseModel):
 class PhysicsSimulationInput(BaseModel):
     object_name: str
     physics_type: Literal["RIGID_BODY", "CLOTH", "COLLISION", "SOFT_BODY", "DYNAMIC_PAINT", "FLUID", "FORCE_FIELD"]
-    action: Literal["enable", "disable", "configure", "bake"] = "enable"
+    action: Literal["enable", "disable", "configure", "bake", "free_bake", "get_bake_status", "set_cache_path"] = "enable"
     rigid_body: Optional[Dict[str, Any]] = None
     cloth: Optional[Dict[str, Any]] = None
     soft_body: Optional[Dict[str, Any]] = None
     fluid: Optional[Dict[str, Any]] = None
     force_field: Optional[Dict[str, Any]] = None
+    cache_path: Optional[str] = None
+    bake_frame_start: Optional[int] = None
+    bake_frame_end: Optional[int] = None
 
 class ParticleSystemInput(BaseModel):
     object_name: str
@@ -254,6 +339,11 @@ class TimelineKeyframeInput(BaseModel):
     value: Optional[Any] = None
     group: Optional[str] = None
     interpolation: Optional[str] = None
+    driver_expression: Optional[str] = None
+    variable_name: Optional[str] = None
+    variable_type: Optional[Literal["SINGLE_PROP", "TRANSFORMS", "ROTATION_DIFF", "AVERAGE"]] = None
+    target_path: Optional[str] = None
+    target_id: Optional[str] = None
 
 class ArmatureRiggingInput(BaseModel):
     action: Literal["create_armature", "pose_bone", "add_constraint", "pose_library"]
@@ -328,8 +418,269 @@ class ExternalDataInput(BaseModel):
 class UniversalIOInput(BaseModel):
     format: Literal["fbx", "obj", "gltf", "glb", "usd", "abc", "stl", "ply", "svg", "bvh", "dae"]
     mode: Literal["import", "export"]
-    filepath: str
+    filepath: Optional[str] = None
     options: Optional[Dict[str, Any]] = None
+    action: Literal["execute", "get_format_options"] = "execute"
+
+class GreasePencilManageInput(BaseModel):
+    action: Literal["create", "list_layers", "add_layer", "remove_layer", "set_active_layer", "configure_layer", "add_stroke", "list_strokes", "set_material"]
+    object_name: Optional[str] = None
+    layer_name: Optional[str] = None
+    new_name: Optional[str] = None
+    points: Optional[List[Dict[str, Any]]] = None
+    material_name: Optional[str] = None
+    properties: Optional[Dict[str, Any]] = None
+
+class VSEStripManageInput(BaseModel):
+    action: Literal["add", "remove", "list", "configure", "set_channel", "move"]
+    strip_name: Optional[str] = None
+    strip_type: Optional[Literal[
+        "MOVIE", "SOUND", "IMAGE", "SCENE", "COLOR", "TEXT",
+        "ADJUSTMENT", "SPEED", "TRANSFORM", "GAUSSIAN_BLUR",
+        "CROSS", "GAMMA_CROSS", "SINGLE_CROSS", "WIPE",
+        "ADD", "SUB", "MUL", "ALPHA_OVER", "ALPHA_UNDER", "OVER_DROP"
+    ]] = None
+    filepath: Optional[str] = None
+    scene_name: Optional[str] = None
+    seq1: Optional[str] = None
+    seq2: Optional[str] = None
+    color: Optional[List[float]] = None
+    channel: int = 1
+    frame_start: Optional[int] = None
+    frame_end: Optional[int] = None
+    properties: Optional[Dict[str, Any]] = None
+
+class CurvesNewManageInput(BaseModel):
+    action: Literal["create", "list", "delete", "add_points", "set_attribute", "get_info"] = "list"
+    object_name: Optional[str] = None
+    curve_count: Optional[int] = None
+    point_count: Optional[int] = None
+    attribute_name: Optional[str] = None
+    attribute_values: Optional[List[Any]] = None
+    attribute_domain: Optional[Literal["POINT", "CURVE"]] = "POINT"
+
+class PointcloudManageInput(BaseModel):
+    action: Literal["create", "list", "delete", "add_points", "set_attribute", "get_info"] = "list"
+    object_name: Optional[str] = None
+    point_count: Optional[int] = None
+    attribute_name: Optional[str] = None
+    attribute_values: Optional[List[Any]] = None
+    attribute_domain: Optional[Literal["POINT"]] = "POINT"
+
+class AssetManageInput(BaseModel):
+    action: Literal["mark", "clear", "list", "set_catalog", "create_catalog", "list_catalogs", "save_catalogs"]
+    asset_type: Optional[Literal["OBJECT", "MATERIAL", "COLLECTION", "NODE_TREE", "WORLD", "SCENE"]] = "OBJECT"
+    asset_name: Optional[str] = None
+    catalog_name: Optional[str] = None
+    catalog_uuid: Optional[str] = None
+    library_name: Optional[str] = None
+
+class ExtensionManageInput(BaseModel):
+    action: Literal["list", "install", "uninstall", "enable", "disable", "refresh", "sync"]
+    package_name: Optional[str] = None
+    filepath: Optional[str] = None
+    repo_name: Optional[str] = None
+
+class SculptSettingsInput(BaseModel):
+    action: Literal["enter_sculpt", "exit_sculpt", "set_symmetry", "set_dyntopo", "set_remesh", "get_info"]
+    object_name: Optional[str] = None
+    symmetry_x: Optional[bool] = None
+    symmetry_y: Optional[bool] = None
+    symmetry_z: Optional[bool] = None
+    use_dyntopo: Optional[bool] = None
+    detail_size: Optional[float] = None
+    remesh_voxel_size: Optional[float] = None
+    remesh_adaptivity: Optional[float] = None
+
+class BrushManageInput(BaseModel):
+    action: Literal["list", "create", "delete", "configure", "set_active"]
+    brush_name: Optional[str] = None
+    new_name: Optional[str] = None
+    brush_type: Optional[Literal["SCULPT", "PAINT", "WEIGHT", "TEXTURE", "GPENCIL"]] = None
+    properties: Optional[Dict[str, Any]] = None
+
+class MarkerManageInput(BaseModel):
+    action: Literal["add", "remove", "list", "set_name", "set_frame", "set_camera"] = "list"
+    marker_name: Optional[str] = None
+    frame: Optional[int] = None
+    new_name: Optional[str] = None
+    camera_name: Optional[str] = None
+
+class CacheFileManageInput(BaseModel):
+    action: Literal["load", "list", "reload", "remove"] = "list"
+    filepath: Optional[str] = None
+    cache_name: Optional[str] = None
+    cache_type: Optional[Literal["ALEMBIC", "USD"]] = "ALEMBIC"
+
+class PoseLibraryManageInput(BaseModel):
+    action: Literal["create", "add_pose", "list_poses", "apply_pose", "remove_pose"] = "list_poses"
+    armature_name: Optional[str] = None
+    pose_name: Optional[str] = None
+    action_name: Optional[str] = None
+
+class LatticeManageInput(BaseModel):
+    action: Literal["create", "delete", "list", "set_points", "get_info", "assign_to_object"] = "list"
+    lattice_name: Optional[str] = None
+    object_name: Optional[str] = None
+    resolution_u: int = 2
+    resolution_v: int = 2
+    resolution_w: int = 2
+    points: Optional[List[List[float]]] = None
+
+class MetaballManageInput(BaseModel):
+    action: Literal["create", "delete", "list", "add_element", "set_render_resolution", "set_viewport_resolution", "get_info"] = "list"
+    metaball_name: Optional[str] = None
+    element_type: Optional[Literal["BALL", "CAPSULE", "CUBE", "PLANE", "ELLIPSOID"]] = None
+    location: Optional[List[float]] = None
+    rotation: Optional[List[float]] = None
+    scale: Optional[List[float]] = None
+    render_resolution: Optional[float] = None
+    viewport_resolution: Optional[float] = None
+
+# ---------------------------------------------------------------------------
+# Composite Workflow Schemas
+# ---------------------------------------------------------------------------
+
+class SetupRenderShotInput(BaseModel):
+    target_object: str = Field(..., description="Object to frame with camera")
+    camera_name: Optional[str] = "ShotCamera"
+    camera_location: Optional[List[float]] = None
+    render_engine: Literal["CYCLES", "BLENDER_EEVEE", "BLENDER_EEVEE_NEXT"] = "BLENDER_EEVEE"
+    resolution: List[int] = [1920, 1080]
+    samples: int = 64
+    output_filepath: str = "/tmp/render_shot_"
+    key_light_color: List[float] = [1.0, 1.0, 1.0]
+    key_light_energy: float = 1000.0
+    fill_light_color: List[float] = [0.8, 0.85, 1.0]
+    fill_light_energy: float = 300.0
+    rim_light_color: List[float] = [1.0, 0.9, 0.8]
+    rim_light_energy: float = 500.0
+    dof_focus_distance: Optional[float] = None
+    focal_length: float = 50.0
+    auto_render: bool = False
+
+class CreateMaterialPresetInput(BaseModel):
+    preset: Literal["rough_stone", "brushed_metal", "car_paint", "glass", "emissive", "subsurface_skin", "wood", "ice", "lava", "hologram"] = Field(..., description="Material preset name")
+    material_name: Optional[str] = None
+    object_name: Optional[str] = None
+    base_color: Optional[List[float]] = None
+    roughness: Optional[float] = None
+    metallic: Optional[float] = None
+    emission_color: Optional[List[float]] = None
+    emission_strength: Optional[float] = None
+    scale: float = 1.0
+
+class BakeAnimationToNLAInput(BaseModel):
+    action_name: str = Field(..., description="Name of the action to bake into NLA")
+    track_name: Optional[str] = None
+    object_name: Optional[str] = None
+    frame_start: int = 1
+    frame_end: int = 250
+    interpolation: Literal["BEZIER", "LINEAR", "CONSTANT"] = "BEZIER"
+    clean_keyframes: bool = True
+    blend_mode: Literal["REPLACE", "ADD", "SUBTRACT", "MULTIPLY"] = "REPLACE"
+    blend_in: int = 0
+    blend_out: int = 0
+    mute_other_tracks: bool = True
+    use_auto_blend: bool = False
+
+class RetargetAnimationInput(BaseModel):
+    source_armature: str = Field(..., description="Source armature with animation")
+    target_armature: str = Field(..., description="Target armature to receive animation")
+    action_name: Optional[str] = None
+    bone_mapping: Optional[Dict[str, str]] = None
+    retarget_mode: Literal["ROTATION_ONLY", "LOCATION_AND_ROTATION"] = "ROTATION_ONLY"
+    bake_to_target: bool = True
+    bake_frame_start: int = 1
+    bake_frame_end: int = 250
+    remove_constraints_after_bake: bool = True
+    use_offset_bones: bool = True
+
+class SetupGeoNodesPipelineInput(BaseModel):
+    object_name: str = Field(..., description="Object to add the geometry nodes modifier to")
+    modifier_name: str = "GeoNodesPipeline"
+    node_group_name: str = "PipelineGroup"
+    pipeline_type: Literal["scatter_instances", "subdivide_displace", "boolean_array", "wave_deform", "point_instance", "custom"] = "scatter_instances"
+    instance_object: Optional[str] = None
+    instance_count: int = 100
+    subdivisions: int = 3
+    displace_strength: float = 1.0
+    wave_amplitude: float = 0.5
+    wave_frequency: float = 2.0
+    array_count: int = 5
+    array_offset: List[float] = [2.0, 0.0, 0.0]
+    custom_node_count: int = 5
+    set_modifier_inputs: Optional[Dict[str, Any]] = None
+    realize_instances: bool = False
+    output_object: Optional[str] = None
+
+class SetupAndBakePhysicsInput(BaseModel):
+    object_name: str = Field(..., description="Object to add physics to")
+    physics_type: Literal["CLOTH", "FLUID", "RIGID_BODY", "SOFT_BODY", "COLLISION", "DYNAMIC_PAINT"] = "CLOTH"
+    bake: bool = True
+    frame_start: int = 1
+    frame_end: int = 250
+    cache_directory: Optional[str] = "/tmp/blender_physics_cache"
+    substeps: int = 10
+    quality: int = 5
+    preset: Optional[Literal["COTTON", "SILK", "DENIM", "LEATHER", "RUBBER"]] = None
+    mass: float = 1.0
+    collision_shape: Literal["BOX", "SPHERE", "CONVEX_HULL", "MESH"] = "MESH"
+    fluid_type: Literal["DOMAIN", "FLOW", "EFFECTOR"] = "DOMAIN"
+    poll_interval: float = 2.0
+    poll_timeout: float = 300.0
+
+class AuditAndCleanupInput(BaseModel):
+    audit_only: bool = True
+    purge_orphans: bool = False
+    pack_textures: bool = False
+    make_paths_relative: bool = False
+    find_missing_files: bool = False
+    search_directory: Optional[str] = None
+    remove_unused_materials: bool = False
+    remove_unused_meshes: bool = False
+    merge_duplicate_materials: bool = False
+    report_objects: bool = True
+    report_materials: bool = True
+    report_textures: bool = True
+    report_performance: bool = True
+
+class UVPipelineExportInput(BaseModel):
+    object_name: str = Field(..., description="Mesh object to UV unwrap and export")
+    uv_method: Literal["SMART", "ANGLE_BASED", "CONFORMAL", "CUBE_PROJECTION"] = "SMART"
+    mark_seams_auto: bool = True
+    seam_angle: float = 88.0
+    pack_islands: bool = True
+    pack_margin: float = 0.01
+    export_uv_layout: bool = False
+    uv_layout_path: str = "/tmp/uv_layout.png"
+    uv_layout_size: List[int] = [1024, 1024]
+    export_format: Optional[Literal["fbx", "obj", "gltf", "glb", "stl", "ply"]] = None
+    export_path: str = "/tmp/exported_mesh"
+    export_params: Optional[Dict[str, Any]] = None
+
+class BatchMarkAssetsInput(BaseModel):
+    object_filter: Optional[Literal["MESH", "CAMERA", "LIGHT", "ARMATURE", "ALL"]] = "MESH"
+    name_pattern: Optional[str] = None
+    catalog_name: Optional[str] = None
+    catalog_path: Optional[str] = None
+    tags: Optional[List[str]] = None
+    generate_previews: bool = True
+    preview_angle: List[float] = [0.6, 0.0, 0.8]
+    unmark_first: bool = False
+    only_unmarked: bool = False
+
+class AutoRigCharacterInput(BaseModel):
+    mesh_object: str = Field(..., description="Character mesh to rig")
+    armature_name: str = "AutoRig"
+    rig_type: Literal["BIPED", "QUADRUPED", "HUMANOID", "SIMPLE"] = "BIPED"
+    bone_count: int = 5
+    auto_weights: bool = True
+    add_ik: bool = True
+    ik_pole_offset: float = 0.5
+    set_bone_rotation_mode: Literal["XYZ", "QUATERNION"] = "XYZ"
+    parent_mesh: bool = True
+    add_root_bone: bool = True
 
 class MCPResponse(BaseModel):
     status: Literal["success", "error"] = "success"
