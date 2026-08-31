@@ -44,7 +44,6 @@ class ObjectsHierarchyHandler(BaseHandler):
             obj = bpy.context.active_object or bpy.data.objects.new(name)
             if name:
                 obj.name = name
-                bpy.data.objects[name] = obj
             return {"status": "success", "name": obj.name if obj else None}
 
         if action == "delete":
@@ -81,9 +80,6 @@ class ObjectsHierarchyHandler(BaseHandler):
             old = obj.name
             new_n = params["new_name"]
             obj.name = new_n
-            if old in bpy.data.objects:
-                del bpy.data.objects[old]
-            bpy.data.objects[new_n] = obj
             return {"status": "success", "old_name": old, "name": obj.name}
 
         if action == "set_parent":
@@ -140,10 +136,7 @@ class ObjectsHierarchyHandler(BaseHandler):
 
         if action == "rename":
             new_n = params["new_name"]
-            if col.name in bpy.data.collections:
-                del bpy.data.collections[col.name]
             col.name = new_n
-            bpy.data.collections[new_n] = col
             return {"status": "success", "name": col.name}
 
         if action == "move":

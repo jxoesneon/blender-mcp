@@ -89,8 +89,24 @@ class AnimationRiggingHandler(BaseHandler):
         if not getattr(target, "animation_data", None) or not target.animation_data.action:
             return {"status": "success", "fcurves": []}
 
+        action = target.animation_data.action
         curves = []
-        for fc in target.animation_data.action.fcurves:
+
+        # Blender 5.x layered action API: fcurves live inside channelbags
+        if not hasattr(action, "fcurves") and hasattr(action, "layers"):
+            for layer in action.layers:
+                for strip in layer.strips:
+                    for cb in strip.channelbags:
+                        for fc in cb.fcurves:
+                            curves.append({
+                                "data_path": fc.data_path,
+                                "array_index": fc.array_index,
+                                "keyframe_count": len(fc.keyframe_points),
+                            })
+            return {"status": "success", "fcurves": curves}
+
+        # Legacy Blender 4.x API
+        for fc in action.fcurves:
             curves.append({
                 "data_path": fc.data_path,
                 "array_index": fc.array_index,
@@ -107,8 +123,22 @@ class AnimationRiggingHandler(BaseHandler):
         data_path = params["data_path"]
         idx = params.get("array_index", 0)
         frame = float(params["frame"])
+        action = target.animation_data.action
 
-        fcurve = next((fc for fc in target.animation_data.action.fcurves if fc.data_path == data_path and fc.array_index == idx), None)
+        # Blender 5.x layered action API: fcurves live inside channelbags
+        fcurve = None
+        if not hasattr(action, "fcurves") and hasattr(action, "layers"):
+            for layer in action.layers:
+                for strip in layer.strips:
+                    for cb in strip.channelbags:
+                        for fc in cb.fcurves:
+                            if fc.data_path == data_path and fc.array_index == idx:
+                                fcurve = fc
+                                break
+        else:
+            # Legacy Blender 4.x API
+            fcurve = next((fc for fc in action.fcurves if fc.data_path == data_path and fc.array_index == idx), None)
+
         if not fcurve:
             raise ValueError(f"F-Curve '{data_path}[{idx}]' not found.")
 

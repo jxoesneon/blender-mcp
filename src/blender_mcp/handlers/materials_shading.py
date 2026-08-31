@@ -34,7 +34,6 @@ class MaterialsShadingHandler(BaseHandler):
             name = new_name or mat_name or "Material"
             mat = bpy.data.materials.new(name=name)
             mat.use_nodes = params.get("use_nodes", True)
-            bpy.data.materials[name] = mat
             return {"status": "success", "material_name": mat.name}
 
         if action == "delete":
@@ -47,7 +46,6 @@ class MaterialsShadingHandler(BaseHandler):
             dup = mat.copy()
             if new_name:
                 dup.name = new_name
-            bpy.data.materials[dup.name] = dup
             return {"status": "success", "material_name": dup.name}
 
         if action == "set_use_nodes":
