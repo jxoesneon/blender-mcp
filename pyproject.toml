@@ -19,6 +19,7 @@ dependencies = [
 
 [project.scripts]
 blender-mcp = "blender_mcp.server:main"
+blender-mcp-launch = "blender_mcp.launch:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
