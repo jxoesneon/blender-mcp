@@ -116,9 +116,15 @@ class RenderingHandler(BaseHandler):
         bpy = cls.get_bpy()
         scene = bpy.context.scene
         scene.use_nodes = True
-        tree = scene.node_tree
+        # Blender 5.x uses compositing_node_group; Blender 4.x uses node_tree
+        tree = getattr(scene, "compositing_node_group", None) or getattr(scene, "node_tree", None)
         if not tree:
-            raise ValueError("Scene node tree not accessible.")
+            # Blender 5.x: create a CompositorNodeTree and assign it
+            if hasattr(scene, "compositing_node_group"):
+                tree = bpy.data.node_groups.new("Compositor", "CompositorNodeTree")
+                scene.compositing_node_group = tree
+            else:
+                raise ValueError("Scene compositor node tree not accessible.")
 
         action = params.get("action", "inspect")
 
@@ -132,7 +138,7 @@ class RenderingHandler(BaseHandler):
             return {"status": "success", "cleared": True}
 
         if action == "add_node":
-            node_type = params.get("node_type", "CompositorNodeComposite")
+            node_type = params.get("node_type", "CompositorNodeRLayers")
             node = tree.nodes.new(type=node_type)
             if params.get("node_name"):
                 node.name = params["node_name"]

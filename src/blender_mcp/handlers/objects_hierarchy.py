@@ -280,6 +280,143 @@ class ObjectsHierarchyHandler(BaseHandler):
         raise ValueError(f"Unknown constraint action: '{action}'")
 
     @classmethod
+    def manage_shape_keys(cls, params: Dict[str, Any]) -> Dict[str, Any]:
+        bpy = cls.get_bpy()
+        obj = cls.get_object(params["object_name"])
+        action = params["action"]
+
+        if not hasattr(obj, "data") or not hasattr(obj.data, "shape_keys"):
+            raise ValueError(f"Object '{obj.name}' has no mesh data supporting shape keys.")
+
+        if action == "list":
+            sk = obj.data.shape_keys
+            if not sk:
+                return {"status": "success", "object": obj.name, "shape_keys": []}
+            blocks = [
+                {"name": kb.name, "value": kb.value, "active": idx == obj.active_shape_key_index}
+                for idx, kb in enumerate(sk.key_blocks)
+            ]
+            return {"status": "success", "object": obj.name, "shape_keys": blocks}
+
+        if action == "add":
+            key_name = params.get("key_name")
+            shape_key_type = params.get("shape_key_type", "BASIS")
+            from_mix = shape_key_type == "FROM_MIX"
+            kb = obj.shape_key_add(name=key_name, from_mix=from_mix)
+            return {"status": "success", "object": obj.name, "shape_key": kb.name, "value": kb.value}
+
+        if action == "set_value":
+            key_name = params["key_name"]
+            value = params.get("value", 0.0)
+            sk = obj.data.shape_keys
+            if not sk or key_name not in sk.key_blocks:
+                raise ValueError(f"Shape key '{key_name}' not found on object '{obj.name}'.")
+            sk.key_blocks[key_name].value = float(value)
+            return {"status": "success", "object": obj.name, "shape_key": key_name, "value": sk.key_blocks[key_name].value}
+
+        if action == "set_active":
+            key_name = params["key_name"]
+            sk = obj.data.shape_keys
+            if not sk or key_name not in sk.key_blocks:
+                raise ValueError(f"Shape key '{key_name}' not found on object '{obj.name}'.")
+            idx = list(sk.key_blocks.keys()).index(key_name)
+            obj.active_shape_key_index = idx
+            return {"status": "success", "object": obj.name, "active_shape_key": key_name, "index": idx}
+
+        if action == "rename":
+            key_name = params["key_name"]
+            new_name = params["new_name"]
+            sk = obj.data.shape_keys
+            if not sk or key_name not in sk.key_blocks:
+                raise ValueError(f"Shape key '{key_name}' not found on object '{obj.name}'.")
+            kb = sk.key_blocks[key_name]
+            kb.name = new_name
+            return {"status": "success", "object": obj.name, "old_name": key_name, "shape_key": kb.name}
+
+        if action == "remove":
+            key_name = params["key_name"]
+            sk = obj.data.shape_keys
+            if not sk or key_name not in sk.key_blocks:
+                raise ValueError(f"Shape key '{key_name}' not found on object '{obj.name}'.")
+            kb = sk.key_blocks[key_name]
+            obj.shape_key_remove(kb)
+            return {"status": "success", "object": obj.name, "removed": key_name}
+
+        raise ValueError(f"Unknown shape key action: '{action}'")
+
+    @classmethod
+    def manage_vertex_groups(cls, params: Dict[str, Any]) -> Dict[str, Any]:
+        obj = cls.get_object(params["object_name"])
+        if not hasattr(obj, "vertex_groups"):
+            raise ValueError(f"Object '{obj.name}' has no vertex groups (not a mesh).")
+        action = params["action"]
+        vgs = obj.vertex_groups
+
+        if action == "list":
+            groups = []
+            for vg in vgs:
+                count = 0
+                if hasattr(obj.data, "vertices"):
+                    for v in obj.data.vertices:
+                        for g in v.groups:
+                            if g.group == vg.index:
+                                count += 1
+                                break
+                groups.append({"name": vg.name, "index": vg.index, "vertex_count": count})
+            return {"status": "success", "object": obj.name, "vertex_groups": groups}
+
+        if action == "add":
+            name = params.get("group_name") or "Group"
+            vg = vgs.new(name=name)
+            return {"status": "success", "vertex_group": vg.name, "index": vg.index}
+
+        if action == "remove":
+            name = params.get("group_name")
+            vg = vgs.get(name) if name else None
+            if not vg:
+                raise ValueError(f"Vertex group '{name}' not found.")
+            vgs.remove(vg)
+            return {"status": "success", "removed": name}
+
+        if action == "assign":
+            name = params.get("group_name")
+            vg = vgs.get(name) if name else None
+            if not vg:
+                raise ValueError(f"Vertex group '{name}' not found.")
+            indices = params.get("vertex_indices", [])
+            weight = params.get("weight", 1.0)
+            vg.add(indices, weight, "REPLACE")
+            return {"status": "success", "vertex_group": vg.name, "assigned": len(indices), "weight": weight}
+
+        if action == "remove_from":
+            name = params.get("group_name")
+            vg = vgs.get(name) if name else None
+            if not vg:
+                raise ValueError(f"Vertex group '{name}' not found.")
+            indices = params.get("vertex_indices", [])
+            vg.remove(indices)
+            return {"status": "success", "vertex_group": vg.name, "removed_from": len(indices)}
+
+        if action == "set_active":
+            name = params.get("group_name")
+            vg = vgs.get(name) if name else None
+            if not vg:
+                raise ValueError(f"Vertex group '{name}' not found.")
+            obj.vertex_groups.active_index = vg.index
+            return {"status": "success", "active": vg.name, "index": vg.index}
+
+        if action == "rename":
+            name = params.get("group_name")
+            vg = vgs.get(name) if name else None
+            if not vg:
+                raise ValueError(f"Vertex group '{name}' not found.")
+            old = vg.name
+            vg.name = params["new_name"]
+            return {"status": "success", "old_name": old, "name": vg.name}
+
+        raise ValueError(f"Unknown vertex group action: '{action}'")
+
+    @classmethod
     def _apply_constraint_config(cls, c: Any, config: Dict[str, Any]):
         for k, v in config.items():
             if k == "target" and isinstance(v, str):

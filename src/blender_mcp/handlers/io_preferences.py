@@ -5,13 +5,23 @@ User Preferences, Addon Lifecycle, External Data, and Universal I/O execution ha
 from __future__ import annotations
 
 import os
-from typing import Any, Dict
+from typing import Any, Dict, List
 from blender_mcp.handlers.base import BaseHandler
 from blender_mcp.utils.serialization import serialize_bpy_value
 
 
 class IOPreferencesHandler(BaseHandler):
     """Executes preferences adjustments, addon management, asset packing, and universal format imports/exports."""
+
+    FORMAT_OPTIONS: Dict[str, List[str]] = {
+        "fbx": ["use_selection", "bake_anim", "axis_forward", "axis_up", "object_types", "use_mesh_modifiers", "mesh_smooth_type", "use_armature_deform_only", "add_leaf_bones", "use_anim", "use_anim_action_all", "batch_mode", "use_custom_props", "apply_unit_scale", "use_space_transform", "bake_space_transform", "path_mode", "embed_textures"],
+        "obj": ["use_selection", "use_materials", "use_smooth_groups", "use_mesh_edges", "use_triangles", "export_smooth_groups", "export_uv", "export_normals", "export_materials", "export_triangulated_mesh", "export_vertex_groups", "export_object_groups", "keep_vertex_order", "global_scale", "axis_forward", "axis_up"],
+        "gltf": ["export_format", "use_selection", "export_materials", "export_colors", "export_cameras", "export_lights", "export_apply", "export_yup", "export_skins", "export_morph", "export_animations", "export_frame_range", "export_def_bones", "export_texcoords", "export_normals", "export_tangents", "export_image_format"],
+        "glb": ["export_format", "use_selection", "export_materials", "export_colors", "export_cameras", "export_lights", "export_apply", "export_yup", "export_skins", "export_morph", "export_animations", "export_frame_range", "export_def_bones", "export_texcoords", "export_normals", "export_tangents", "export_image_format"],
+        "usd": ["export_textures", "export_materials", "export_meshes", "export_lights", "export_cameras", "export_animation", "export_hair", "export_uvmaps", "export_normals", "export_materials", "selection_only", "visible_objects_only", "export_armatures", "export_shapekeys", "generate_preview_surface", "export_textures", "overwrite_textures", "export_relative_paths"],
+        "stl": ["use_selection", "ascii", "use_mesh_modifiers", "axis_forward", "axis_up", "global_scale", "batch_mode"],
+        "ply": ["use_selection", "ascii", "use_mesh_modifiers", "axis_forward", "axis_up", "global_scale", "batch_mode"],
+    }
 
     @classmethod
     def manage_user_preferences(cls, params: Dict[str, Any]) -> Dict[str, Any]:
@@ -110,8 +120,23 @@ class IOPreferencesHandler(BaseHandler):
         bpy = cls.get_bpy()
         fmt = params["format"].lower()
         mode = params["mode"].lower()
-        filepath = params["filepath"]
+        action = params.get("action", "execute")
+        filepath = params.get("filepath")
         opts = params.get("options", {})
+
+        if action == "get_format_options":
+            known = cls.FORMAT_OPTIONS.get(fmt, [])
+            return {"status": "success", "format": fmt, "known_options": known}
+
+        if not filepath:
+            raise ValueError("filepath is required for import/export.")
+
+        known = cls.FORMAT_OPTIONS.get(fmt, [])
+        if known:
+            unknown = [k for k in opts if k not in known]
+            if unknown:
+                # pass through but warn
+                pass
 
         if mode == "export":
             os.makedirs(os.path.dirname(os.path.abspath(filepath)) or ".", exist_ok=True)

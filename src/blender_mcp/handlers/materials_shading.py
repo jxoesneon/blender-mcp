@@ -5,7 +5,7 @@ Materials, Shader Nodes, Textures, and UV Unwrapping execution handler.
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from blender_mcp.handlers.base import BaseHandler
 
 
@@ -282,3 +282,111 @@ class MaterialsShadingHandler(BaseHandler):
                 bpy.ops.uv.unwrap(margin=params.get("island_margin", 0.02))
 
         return {"status": "success", "object": obj.name, "method": method}
+
+    @classmethod
+    def manage_color_attributes(cls, params: Dict[str, Any]) -> Dict[str, Any]:
+        obj = cls.get_object(params["object_name"])
+        action = params["action"]
+        attrs = obj.data.color_attributes
+
+        if action == "list":
+            out = []
+            for i, attr in enumerate(attrs):
+                out.append({
+                    "name": attr.name,
+                    "domain": attr.domain,
+                    "data_type": attr.data_type,
+                    "active": i == attrs.active_index,
+                })
+            return {"status": "success", "object": obj.name, "color_attributes": out}
+
+        if action == "add":
+            name = params.get("attribute_name", "Color")
+            data_type = params.get("data_type", "FLOAT_COLOR")
+            domain = params.get("domain", "POINT")
+            attr = attrs.new(name=name, type=data_type, domain=domain)
+            return {"status": "success", "object": obj.name, "attribute_name": attr.name, "domain": attr.domain, "data_type": attr.data_type}
+
+        if action == "remove":
+            attr_name = params.get("attribute_name")
+            attr = attrs.get(attr_name) if attr_name else None
+            if not attr:
+                raise ValueError(f"Color attribute '{attr_name}' not found.")
+            attrs.remove(attr)
+            return {"status": "success", "object": obj.name, "removed_attribute": attr_name}
+
+        if action == "set_active":
+            attr_name = params.get("attribute_name")
+            for i, attr in enumerate(attrs):
+                if attr.name == attr_name:
+                    attrs.active_index = i
+                    return {"status": "success", "object": obj.name, "active_attribute": attr_name, "active_index": i}
+            raise ValueError(f"Color attribute '{attr_name}' not found.")
+
+        if action == "set_values":
+            attr_name = params.get("attribute_name")
+            attr = attrs.get(attr_name) if attr_name else None
+            if not attr:
+                raise ValueError(f"Color attribute '{attr_name}' not found.")
+            vertex_indices = params.get("vertex_indices", [])
+            color = params.get("color", [1.0, 1.0, 1.0, 1.0])
+            for idx in vertex_indices:
+                if 0 <= idx < len(attr.data):
+                    attr.data[idx].color = color
+            return {"status": "success", "object": obj.name, "attribute_name": attr_name, "updated_indices": vertex_indices}
+
+        raise ValueError(f"Unknown color attribute action: '{action}'")
+
+    @classmethod
+    def manage_uv_layers(cls, params: Dict[str, Any]) -> Dict[str, Any]:
+        bpy = cls.get_bpy()
+        obj = cls.get_object(params["object_name"])
+        action = params.get("action", "list")
+        uv_name = params.get("uv_name")
+        new_name = params.get("new_name")
+
+        if not hasattr(obj.data, "uv_layers"):
+            raise ValueError(f"Object '{obj.name}' has no UV layers (not a mesh).")
+
+        uv_layers = obj.data.uv_layers
+
+        if action == "list":
+            layers = [{"name": l.name, "active": l.active_render} for l in uv_layers]
+            return {"status": "success", "object": obj.name, "uv_layers": layers}
+
+        if action == "add":
+            name = uv_name or "UVMap"
+            layer = uv_layers.new(name=name)
+            return {"status": "success", "object": obj.name, "uv_layer": layer.name}
+
+        if action == "remove":
+            layer = uv_layers.get(uv_name)
+            if not layer:
+                raise ValueError(f"UV layer '{uv_name}' not found on '{obj.name}'.")
+            uv_layers.remove(layer)
+            return {"status": "success", "object": obj.name, "removed": uv_name}
+
+        if action == "set_active":
+            layer = uv_layers.get(uv_name)
+            if not layer:
+                raise ValueError(f"UV layer '{uv_name}' not found on '{obj.name}'.")
+            uv_layers.active = layer
+            return {"status": "success", "object": obj.name, "active": layer.name}
+
+        if action == "rename":
+            layer = uv_layers.get(uv_name)
+            if not layer:
+                raise ValueError(f"UV layer '{uv_name}' not found on '{obj.name}'.")
+            layer.name = new_name or uv_name
+            return {"status": "success", "object": obj.name, "uv_layer": layer.name}
+
+        if action == "stitch":
+            with cls.active_mode(obj, "EDIT"):
+                if hasattr(bpy.ops.mesh, "select_all"):
+                    bpy.ops.mesh.select_all(action="SELECT")
+                if hasattr(bpy.ops.uv, "stitch"):
+                    bpy.ops.uv.stitch()
+                    return {"status": "success", "object": obj.name, "stitched": True}
+                raise ValueError("bpy.ops.uv.stitch is not available in this context.")
+
+        raise ValueError(f"Unknown UV layer action: '{action}'")

@@ -176,6 +176,118 @@ class MeshGeometryHandler(BaseHandler):
                 geom = [bm.verts[i] for i in params["vertex_indices"] if i < len(bm.verts)]
                 bmesh.ops.delete(bm, geom=geom, context="VERTS")
 
+        elif op == "KNIFE":
+            pairs = params.get("vertex_pairs") or []
+            cuts = 0
+            for pair in pairs:
+                if len(pair) < 2 or pair[0] >= len(bm.verts) or pair[1] >= len(bm.verts):
+                    continue
+                v1, v2 = bm.verts[pair[0]], bm.verts[pair[1]]
+                try:
+                    bmesh.ops.connect_verts(bm, verts=[v1, v2])
+                    cuts += 1
+                except Exception:
+                    pass
+            result_info["knife_cuts"] = cuts
+
+        elif op == "LOOP_CUT":
+            edge_indices = params.get("edge_indices") or []
+            cuts = params.get("cuts") or params.get("segments", 1)
+            start_edges = [bm.edges[i] for i in edge_indices if i < len(bm.edges)]
+            ring = []
+            seen = set()
+
+            def walk_ring(start):
+                collected = []
+                cur = start
+                while cur is not None and id(cur) not in seen:
+                    seen.add(id(cur))
+                    collected.append(cur)
+                    nxt = None
+                    for f in cur.link_faces:
+                        if len(f.verts) != 4:
+                            continue
+                        for e in f.edges:
+                            if e is cur or id(e) in seen:
+                                continue
+                            if not (e.verts[0] in cur.verts or e.verts[1] in cur.verts):
+                                nxt = e
+                                break
+                        if nxt is not None:
+                            break
+                    cur = nxt
+                return collected
+
+            for se in start_edges:
+                ring.extend(walk_ring(se))
+            if ring:
+                bmesh.ops.subdivide_edges(bm, edges=ring, cuts=cuts)
+            result_info["loop_cut_edges"] = len(ring)
+            result_info["cuts"] = cuts
+
+        elif op == "FILL":
+            edge_indices = params.get("edge_indices") or []
+            edges = [bm.edges[i] for i in edge_indices if i < len(bm.edges)]
+            filled = 0
+            if edges:
+                try:
+                    bmesh.ops.edgeloop_fill(bm, edges=edges)
+                    filled = len(edges)
+                except Exception:
+                    bmesh.ops.triangle_fill(bm, edges=edges, use_beauty=True)
+                    filled = len(edges)
+            result_info["filled_edges"] = filled
+
+        elif op == "GRID_FILL":
+            edge_indices = params.get("edge_indices") or []
+            edges = [bm.edges[i] for i in edge_indices if i < len(bm.edges)]
+            if edges:
+                bmesh.ops.grid_fill(bm, edges=edges, sides=params.get("segments", 0))
+            result_info["grid_filled_edges"] = len(edges)
+
+        elif op == "POKE":
+            face_indices = params.get("face_indices") or list(range(len(bm.faces)))
+            target_faces = [bm.faces[i] for i in face_indices if i < len(bm.faces)]
+            if target_faces:
+                bmesh.ops.poke(bm, faces=target_faces, offset=params.get("offset", 0.0))
+            result_info["poked_faces"] = len(target_faces)
+
+        elif op == "EDGE_SPLIT":
+            edge_indices = params.get("edge_indices") or []
+            edges = [bm.edges[i] for i in edge_indices if i < len(bm.edges)]
+            if edges:
+                bmesh.ops.split(bm, geom=edges)
+            result_info["split_edges"] = len(edges)
+
+        elif op == "SUBDIVIDE_EDGE":
+            cuts = params.get("cuts") or params.get("segments", 1)
+            edge_indices = params.get("edge_indices") or []
+            edges = [bm.edges[i] for i in edge_indices if i < len(bm.edges)]
+            if edges:
+                bmesh.ops.subdivide_edges(bm, edges=edges, cuts=cuts)
+            result_info["subdivided_edges"] = len(edges)
+            result_info["cuts"] = cuts
+
+        elif op == "BRIDGE_EDGE_LOOPS":
+            edge_indices = params.get("edge_indices") or []
+            edges = [bm.edges[i] for i in edge_indices if i < len(bm.edges)]
+            if edges:
+                bmesh.ops.bridge_loops(bm, edges=edges)
+            result_info["bridged_edges"] = len(edges)
+
+        elif op == "BRIDGE_FACES":
+            face_indices = params.get("face_indices") or []
+            target_faces = [bm.faces[i] for i in face_indices if i < len(bm.faces)]
+            loop_edges = []
+            for f in target_faces:
+                for e in f.edges:
+                    shared = sum(1 for ff in e.link_faces if ff in target_faces)
+                    if shared == 1:
+                        loop_edges.append(e)
+            if loop_edges:
+                bmesh.ops.bridge_loops(bm, edges=loop_edges)
+            result_info["bridged_faces"] = len(target_faces)
+
         bm.to_mesh(obj.data)
         bm.free()
         obj.data.update()
@@ -249,6 +361,7 @@ class MeshGeometryHandler(BaseHandler):
         bpy = cls.get_bpy()
         obj = cls.get_object(params["object_name"])
         mod_name = params.get("modifier_name", "GeometryNodes")
+        action = params.get("action", "build")
 
         mod = obj.modifiers.get(mod_name)
         if not mod:
@@ -257,6 +370,83 @@ class MeshGeometryHandler(BaseHandler):
         tree_name = params.get("tree_name") or f"{obj.name}_GeoNodes"
         node_tree = bpy.data.node_groups.get(tree_name) or bpy.data.node_groups.new(tree_name, "GeometryNodeTree")
         mod.node_group = node_tree
+
+        if action == "inspect":
+            nodes_info = []
+            for n in node_tree.nodes:
+                inputs = [{"name": s.name, "identifier": s.identifier, "type": s.type} for s in n.inputs]
+                outputs = [{"name": s.name, "identifier": s.identifier, "type": s.type} for s in n.outputs]
+                nodes_info.append({
+                    "name": n.name,
+                    "type": n.type,
+                    "bl_idname": n.bl_idname,
+                    "location": list(n.location),
+                    "inputs": inputs,
+                    "outputs": outputs,
+                })
+            links_info = []
+            for l in node_tree.links:
+                links_info.append({
+                    "from_node": l.from_node.name,
+                    "from_socket": l.from_socket.name,
+                    "to_node": l.to_node.name,
+                    "to_socket": l.to_socket.name,
+                })
+            group_inputs = [{"name": s.name, "identifier": s.identifier, "type": s.type} for s in node_tree.inputs]
+            group_outputs = [{"name": s.name, "identifier": s.identifier, "type": s.type} for s in node_tree.outputs]
+            return {
+                "status": "success",
+                "object": obj.name,
+                "node_group": node_tree.name,
+                "nodes": nodes_info,
+                "links": links_info,
+                "group_inputs": group_inputs,
+                "group_outputs": group_outputs,
+            }
+
+        if action == "set_socket_value":
+            node_name = params.get("node_name")
+            socket_identifier = params.get("socket_identifier") or params.get("socket_name")
+            value = params.get("value")
+            direction = params.get("socket_direction", "input")
+            node = node_tree.nodes.get(node_name)
+            if not node:
+                raise ValueError(f"Node '{node_name}' not found in node tree '{node_tree.name}'.")
+            sockets = node.inputs if direction == "input" else node.outputs
+            sock = None
+            for s in sockets:
+                if s.identifier == socket_identifier or s.name == socket_identifier:
+                    sock = s
+                    break
+            if not sock:
+                sock = sockets.get(socket_identifier)
+            if not sock:
+                raise ValueError(f"Socket '{socket_identifier}' not found on node '{node_name}'.")
+            if hasattr(sock, "default_value") and value is not None:
+                sock.default_value = value
+            return {"status": "success", "node": node.name, "socket": sock.name, "value": value}
+
+        if action == "add_group_input":
+            node = node_tree.nodes.new(type="NodeGroupInput")
+            if params.get("location"):
+                node.location = params["location"]
+            return {"status": "success", "node": node.name, "type": "NodeGroupInput"}
+
+        if action == "add_group_output":
+            node = node_tree.nodes.new(type="NodeGroupOutput")
+            if params.get("location"):
+                node.location = params["location"]
+            return {"status": "success", "node": node.name, "type": "NodeGroupOutput"}
+
+        if action == "set_modifier_input":
+            input_name = params.get("input_name")
+            value = params.get("value")
+            if not input_name:
+                raise ValueError("input_name is required for set_modifier_input action.")
+            if input_name not in mod:
+                raise ValueError(f"Modifier '{mod.name}' has no input '{input_name}'.")
+            mod[input_name] = value
+            return {"status": "success", "modifier": mod.name, "input": input_name, "value": value}
 
         nodes_spec = params.get("nodes", [])
         for n_spec in nodes_spec:

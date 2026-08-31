@@ -160,9 +160,60 @@ class ModifiersPhysicsHandler(BaseHandler):
                 return {"status": "success", "physics": "FORCE_FIELD"}
 
         if action == "bake":
+            cache_path = params.get("cache_path")
+            frame_start = params.get("bake_frame_start")
+            frame_end = params.get("bake_frame_end")
+            scene = bpy.context.scene
+            if frame_start is not None:
+                scene.frame_start = int(frame_start)
+            if frame_end is not None:
+                scene.frame_end = int(frame_end)
+            if cache_path and hasattr(bpy.ops.ptcache, "bake_from_cache"):
+                try:
+                    bpy.ops.ptcache.bake_from_cache()
+                except Exception:
+                    pass
             if hasattr(bpy.ops.ptcache, "bake_all"):
                 bpy.ops.ptcache.bake_all(bake=True)
-            return {"status": "success", "message": "Bake completed."}
+            return {"status": "success", "message": "Bake completed.", "cache_path": cache_path}
+
+        if action == "free_bake":
+            if hasattr(bpy.ops.ptcache, "free_bake_all"):
+                bpy.ops.ptcache.free_bake_all()
+            return {"status": "success", "message": "Bake freed."}
+
+        if action == "get_bake_status":
+            mod_name = {
+                "CLOTH": "Cloth",
+                "FLUID": "Fluid",
+                "COLLISION": "Collision",
+            }.get(phys_type)
+            baked = False
+            if mod_name:
+                mod = obj.modifiers.get(mod_name)
+                if mod and hasattr(mod, "point_cache"):
+                    baked = bool(getattr(mod.point_cache, "is_baked", False))
+            elif phys_type == "RIGID_BODY":
+                rb_world = getattr(bpy.context.scene, "rigid_body_world", None)
+                if rb_world and rb_world.point_cache:
+                    baked = bool(rb_world.point_cache.is_baked)
+            return {"status": "success", "physics": phys_type, "is_baked": baked}
+
+        if action == "set_cache_path":
+            cache_path = params.get("cache_path")
+            if not cache_path:
+                raise ValueError("cache_path is required for set_cache_path.")
+            mod_name = {
+                "CLOTH": "Cloth",
+                "FLUID": "Fluid",
+                "COLLISION": "Collision",
+            }.get(phys_type)
+            if mod_name:
+                mod = obj.modifiers.get(mod_name)
+                if mod and hasattr(mod, "point_cache"):
+                    mod.point_cache.filepath = cache_path
+                    return {"status": "success", "cache_path": cache_path, "physics": phys_type}
+            raise ValueError(f"set_cache_path not supported for physics type '{phys_type}'.")
 
         return {"status": "success", "physics": phys_type}
 

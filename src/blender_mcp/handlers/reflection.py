@@ -263,3 +263,241 @@ class ReflectionHandler(BaseHandler):
             "traceback": tb_str,
             "rolled_back": not success and use_rollback,
         }
+
+    @classmethod
+    def manage_undo(cls, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Performs undo/redo control via bpy.ops.ed."""
+        bpy = cls.get_bpy()
+        action = params["action"]
+        steps = int(params.get("steps", 1))
+
+        if action == "undo":
+            for _ in range(steps):
+                bpy.ops.ed.undo()
+            result = {"action": "undo", "steps": steps}
+        elif action == "redo":
+            for _ in range(steps):
+                bpy.ops.ed.redo()
+            result = {"action": "redo", "steps": steps}
+        elif action == "undo_history":
+            bpy.ops.ed.undo_history(item=steps)
+            result = {"action": "undo_history", "item": steps}
+        elif action == "push_undo_step":
+            for _ in range(steps):
+                bpy.ops.ed.undo_push(message="MCP undo step")
+            result = {"action": "push_undo_step", "steps": steps}
+        else:
+            raise ValueError(f"Unknown undo action '{action}'. Expected: undo, redo, undo_history, push_undo_step")
+
+        return {"status": "success", **result}
+
+    @classmethod
+    def get_object_info(cls, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Returns a structured JSON dump of an object's key properties and data."""
+        bpy = cls.get_bpy()
+        obj = cls.get_object(params["object_name"])
+
+        anim_data = obj.animation_data
+        animation_info = {"has_action": False, "action_name": None}
+        if anim_data and anim_data.action:
+            animation_info = {"has_action": True, "action_name": anim_data.action.name}
+
+        modifiers = [{"name": m.name, "type": m.type} for m in obj.modifiers]
+        materials = [m.name for m in obj.data.materials] if hasattr(obj.data, "materials") and obj.data.materials else []
+        vertex_groups = [vg.name for vg in obj.vertex_groups] if hasattr(obj, "vertex_groups") else []
+        particle_systems = [ps.name for ps in obj.particle_systems] if hasattr(obj, "particle_systems") else []
+        children = [c.name for c in bpy.data.objects if c.parent and c.parent.name == obj.name]
+
+        custom_props = {}
+        if hasattr(obj, "keys"):
+            for key in obj.keys():
+                if key.startswith("_"):
+                    continue
+                try:
+                    custom_props[key] = serialize_bpy_value(obj[key])
+                except Exception:
+                    pass
+
+        return {
+            "status": "success",
+            "name": obj.name,
+            "type": obj.type,
+            "location": list(obj.location),
+            "rotation": list(obj.rotation_euler),
+            "scale": list(obj.scale),
+            "dimensions": list(obj.dimensions),
+            "parent": obj.parent.name if obj.parent else None,
+            "children": children,
+            "modifiers": modifiers,
+            "materials": materials,
+            "vertex_groups": vertex_groups,
+            "particle_systems": particle_systems,
+            "animation_data": animation_info,
+            "custom_properties": custom_props,
+        }
+
+    @classmethod
+    def list_properties(cls, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Enumerates all settable properties on a data path with types and current values."""
+        bpy = cls.get_bpy()
+        path = params["path"].strip()
+        include_readonly = params.get("include_readonly", False)
+
+        eval_globals = {"bpy": bpy, "C": bpy.context, "D": bpy.data}
+        try:
+            obj = eval(path, eval_globals)
+        except Exception as e:
+            raise BlenderExecutionError(f"Failed to evaluate path '{path}': {str(e)}") from e
+
+        bl_rna = getattr(type(obj), "bl_rna", None) or getattr(obj, "bl_rna", None)
+        if bl_rna is None:
+            raise ValueError(f"Object at '{path}' has no bl_rna introspection available.")
+
+        properties = []
+        for prop in bl_rna.properties:
+            if prop.identifier == "rna_type":
+                continue
+            if prop.is_readonly and not include_readonly:
+                continue
+            try:
+                value = getattr(obj, prop.identifier)
+            except Exception:
+                value = None
+            try:
+                serialized = serialize_bpy_value(value)
+            except Exception:
+                serialized = str(value) if value is not None else None
+            properties.append({
+                "name": prop.identifier,
+                "type": prop.type,
+                "is_readonly": prop.is_readonly,
+                "is_array": getattr(prop, "is_array", False),
+                "value": serialized,
+            })
+
+        return {
+            "status": "success",
+            "path": path,
+            "type_name": type(obj).__name__,
+            "properties": properties,
+        }
+
+    @classmethod
+    def simulate_input(cls, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Simulates mouse/keyboard events via bpy.context.window.event_simulate().
+
+        Requires Blender to be launched with --enable-event-simulate flag.
+        """
+        bpy = cls.get_bpy()
+        event_type = params["event_type"]
+        mouse_x = params.get("mouse_x")
+        mouse_y = params.get("mouse_y")
+        key = params.get("key")
+        value = params.get("value", "PRESS")
+        region_name = params.get("region_name", "WINDOW")
+
+        win = bpy.context.window
+        if win is None:
+            raise BlenderExecutionError(
+                "No active Blender window. Event simulation requires a GUI window context."
+            )
+
+        event_simulate = getattr(win, "event_simulate", None)
+        if event_simulate is None:
+            raise BlenderExecutionError(
+                "Window.event_simulate not available. "
+                "Launch Blender with --enable-event-simulate flag to enable event simulation."
+            )
+
+        # Build kwargs for Window.event_simulate()
+        # The API uses: type, value, x, y, unicode, shift, ctrl, alt, oskey, hyper
+        # For MOUSEMOVE events, value must be 'NOTHING'
+        if event_type == "MOUSEMOVE":
+            value = "NOTHING"
+        kwargs: Dict[str, Any] = {
+            "type": event_type,
+            "value": value,
+        }
+        if mouse_x is not None:
+            kwargs["x"] = int(mouse_x)
+        if mouse_y is not None:
+            kwargs["y"] = int(mouse_y)
+        if key is not None:
+            # For keyboard events, 'type' should be the key (e.g. 'A', 'SPACE')
+            kwargs["type"] = key
+
+        try:
+            event_simulate(**kwargs)
+            return {
+                "status": "success",
+                "event_type": kwargs["type"],
+                "mouse_x": mouse_x,
+                "mouse_y": mouse_y,
+                "key": key,
+                "value": value,
+                "region_name": region_name,
+            }
+        except Exception as e:
+            raise BlenderExecutionError(
+                f"event_simulate failed: {str(e)}. "
+                "Ensure Blender was launched with --enable-event-simulate flag."
+            ) from e
+
+    @classmethod
+    def exec_script_json(cls, params: Dict[str, Any]) -> Dict[str, Any]:
+        """Executes a Python script that must end with a `result` variable; returns structured JSON."""
+        bpy = cls.get_bpy()
+        script = params["script"]
+        use_rollback = params.get("use_transaction_rollback", True)
+
+        exec_globals = {
+            "bpy": bpy,
+            "C": bpy.context,
+            "D": bpy.data,
+            "math": math,
+        }
+
+        stdout_capture = io.StringIO()
+        stderr_capture = io.StringIO()
+
+        if use_rollback and hasattr(bpy.ops.ed, "undo_push"):
+            bpy.ops.ed.undo_push(message="MCP Exec Script JSON")
+
+        success = True
+        err_msg = None
+        tb_str = None
+
+        with contextlib.redirect_stdout(stdout_capture), contextlib.redirect_stderr(stderr_capture):
+            try:
+                exec(script, exec_globals)
+            except Exception as e:
+                success = False
+                err_msg = str(e)
+                tb_str = traceback.format_exc()
+                if use_rollback and hasattr(bpy.ops.ed, "undo"):
+                    bpy.ops.ed.undo()
+
+        if not success:
+            return {
+                "status": "error",
+                "result": None,
+                "stdout": stdout_capture.getvalue(),
+                "stderr": stderr_capture.getvalue(),
+                "error": err_msg,
+                "traceback": tb_str,
+                "rolled_back": use_rollback,
+            }
+
+        result_val = exec_globals.get("result")
+        if "result" not in exec_globals:
+            return {
+                "status": "success",
+                "result": None,
+                "stdout": stdout_capture.getvalue(),
+            }
+
+        return {
+            "status": "success",
+            "result": serialize_bpy_value(result_val),
+            "stdout": stdout_capture.getvalue(),
+        }

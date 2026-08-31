@@ -280,7 +280,139 @@ class SceneWorldHandler(BaseHandler):
                 "lens": space_3d.lens,
             }
 
+        view3d_area = None
+        view3d_region = None
+        for area in bpy.context.screen.areas:
+            if area.type == "VIEW_3D":
+                view3d_area = area
+                for region in area.regions:
+                    if region.type == "WINDOW":
+                        view3d_region = region
+                        break
+                break
+
+        def run_view3d_op(op_callable, **kwargs):
+            if view3d_area is None or view3d_region is None:
+                raise RuntimeError("No VIEW_3D area/region available for viewport operator.")
+            with bpy.context.temp_override(
+                area=view3d_area,
+                region=view3d_region,
+                space_data=view3d_area.spaces.active,
+                screen=bpy.context.screen,
+                window=bpy.context.window,
+            ):
+                return op_callable(**kwargs)
+
+        if action == "frame_to_selected":
+            run_view3d_op(bpy.ops.view3d.view_selected)
+            return {"status": "success", "action": "frame_to_selected"}
+
+        if action == "frame_all":
+            run_view3d_op(bpy.ops.view3d.view_all)
+            return {"status": "success", "action": "frame_all"}
+
+        if action == "orbit":
+            run_view3d_op(bpy.ops.view3d.orbit)
+            return {"status": "success", "action": "orbit"}
+
+        if action == "pan":
+            run_view3d_op(bpy.ops.view3d.pan)
+            return {"status": "success", "action": "pan"}
+
+        if action == "zoom":
+            delta = params.get("delta", 0)
+            run_view3d_op(bpy.ops.view3d.zoom, delta=delta)
+            return {"status": "success", "action": "zoom", "delta": delta}
+
+        if action == "set_camera_view":
+            if params.get("use_active_camera") and bpy.context.scene.camera:
+                space_3d.camera = bpy.context.scene.camera
+            run_view3d_op(bpy.ops.view3d.view_camera)
+            return {"status": "success", "action": "set_camera_view"}
+
         raise ValueError(f"Unknown viewport action: '{action}'")
+
+    @classmethod
+    def manage_view_layers(cls, params: Dict[str, Any]) -> Dict[str, Any]:
+        bpy = cls.get_bpy()
+        action = params.get("action", "list")
+        scene = bpy.context.scene
+        view_layers = scene.view_layers
+
+        if action == "list":
+            return {
+                "status": "success",
+                "scene": scene.name,
+                "active_view_layer": bpy.context.view_layer.name if bpy.context.view_layer else None,
+                "view_layers": [
+                    {
+                        "name": vl.name,
+                        "use_solid": vl.use_solid,
+                        "use_sky": vl.use_sky,
+                        "use_ao": vl.use_ao,
+                        "use_strand": vl.use_strand,
+                        "use_volume": getattr(vl, "use_volumes", getattr(vl, "use_volume", False)),
+                        "use_grease_pencil": vl.use_grease_pencil,
+                        "samples": getattr(vl, "samples_pass", 0),
+                    }
+                    for vl in view_layers
+                ],
+            }
+
+        if action == "add":
+            name = params.get("layer_name", "ViewLayer")
+            vl = view_layers.new(name=name)
+            return {"status": "success", "view_layer": vl.name, "scene": scene.name}
+
+        if action == "remove":
+            name = params.get("layer_name")
+            if not name:
+                raise ValueError("layer_name is required for remove action.")
+            vl = view_layers.get(name)
+            if not vl:
+                raise ValueError(f"View layer '{name}' not found in scene '{scene.name}'.")
+            if len(view_layers) <= 1:
+                raise ValueError("Cannot remove the only view layer in the scene.")
+            view_layers.remove(vl)
+            return {"status": "success", "removed_view_layer": name, "scene": scene.name}
+
+        if action == "set_active":
+            name = params.get("layer_name")
+            if not name:
+                raise ValueError("layer_name is required for set_active action.")
+            vl = view_layers.get(name)
+            if not vl:
+                raise ValueError(f"View layer '{name}' not found in scene '{scene.name}'.")
+            bpy.context.window.view_layer = vl
+            return {"status": "success", "active_view_layer": vl.name, "scene": scene.name}
+
+        if action == "configure":
+            name = params.get("layer_name")
+            if not name:
+                raise ValueError("layer_name is required for configure action.")
+            vl = view_layers.get(name)
+            if not vl:
+                raise ValueError(f"View layer '{name}' not found in scene '{scene.name}'.")
+            if params.get("new_name"):
+                vl.name = params["new_name"]
+            settings = params.get("settings", {}) or {}
+            for key, value in settings.items():
+                if hasattr(vl, key):
+                    setattr(vl, key, value)
+            return {
+                "status": "success",
+                "view_layer": vl.name,
+                "scene": scene.name,
+                "use_solid": vl.use_solid,
+                "use_sky": vl.use_sky,
+                "use_ao": vl.use_ao,
+                "use_strand": vl.use_strand,
+                "use_volume": getattr(vl, "use_volumes", getattr(vl, "use_volume", False)),
+                "use_grease_pencil": vl.use_grease_pencil,
+                "samples": getattr(vl, "samples_pass", 0),
+            }
+
+        raise ValueError(f"Unknown view layer action: '{action}'")
 
     @classmethod
     def manage_camera(cls, params: Dict[str, Any]) -> Dict[str, Any]:
@@ -459,3 +591,82 @@ class SceneWorldHandler(BaseHandler):
 
         if params.get("use_shadow") is not None and hasattr(light_data, "use_shadow"):
             light_data.use_shadow = params["use_shadow"]
+
+    @classmethod
+    def manage_lightprobes(cls, params: Dict[str, Any]) -> Dict[str, Any]:
+        bpy = cls.get_bpy()
+        action = params.get("action", "list")
+
+        if action == "list":
+            probes = []
+            for obj in bpy.context.scene.objects:
+                if obj.type == "LIGHT_PROBE":
+                    data = obj.data
+                    probes.append({
+                        "name": obj.name,
+                        "probe_type": data.type,
+                        "location": list(obj.location),
+                        "influence_distance": getattr(data, "influence_distance", None),
+                        "influence_falloff": getattr(data, "influence_falloff", None),
+                        "clip_start": getattr(data, "clip_start", None),
+                        "clip_end": getattr(data, "clip_end", None),
+                        "resolution": getattr(data, "resolution", None),
+                    })
+            return {"status": "success", "lightprobes": probes}
+
+        if action == "create":
+            probe_type = params.get("probe_type", "CUBEMAP")
+            if probe_type not in ("CUBEMAP", "PLANAR", "GRID"):
+                raise ValueError(f"Invalid probe_type: '{probe_type}'. Must be CUBEMAP, PLANAR, or GRID.")
+            bpy.ops.object.lightprobe_add(type=probe_type)
+            obj = bpy.context.active_object
+            if params.get("lightprobe_name"):
+                obj.name = params["lightprobe_name"]
+            if params.get("location"):
+                obj.location = params["location"]
+            if params.get("rotation"):
+                obj.rotation_euler = params["rotation"]
+            props = params.get("properties", {})
+            cls._apply_lightprobe_properties(obj.data, props)
+            return {
+                "status": "success",
+                "lightprobe_name": obj.name,
+                "probe_type": obj.data.type,
+            }
+
+        lightprobe_name = params.get("lightprobe_name")
+        if not lightprobe_name:
+            raise ValueError("lightprobe_name is required for this action.")
+        obj = cls.get_object(lightprobe_name)
+        if obj.type != "LIGHT_PROBE":
+            raise TypeError(f"Object '{lightprobe_name}' is not a Light Probe.")
+
+        if action == "delete":
+            bpy.data.objects.remove(obj, do_unlink=True)
+            return {"status": "success", "deleted_lightprobe": lightprobe_name}
+
+        if action == "configure":
+            props = params.get("properties", {})
+            if params.get("location"):
+                obj.location = params["location"]
+            if params.get("rotation"):
+                obj.rotation_euler = params["rotation"]
+            cls._apply_lightprobe_properties(obj.data, props)
+            return {"status": "success", "configured_lightprobe": obj.name}
+
+        raise ValueError(f"Unknown lightprobe action: '{action}'")
+
+    @classmethod
+    def _apply_lightprobe_properties(cls, probe_data: Any, props: Dict[str, Any]):
+        simple_props = [
+            "influence_distance", "influence_falloff", "clip_start", "clip_end",
+            "resolution", "grid_resolution_x", "grid_resolution_y", "grid_resolution_z",
+            "visibility_buffer_bias", "visibility_bleed_bias", "visibility_blur",
+            "intensity", "parallax_type", "parallax_distance",
+        ]
+        for key in simple_props:
+            if key in props and hasattr(probe_data, key):
+                setattr(probe_data, key, props[key])
+        for key, value in props.items():
+            if key not in simple_props and hasattr(probe_data, key):
+                setattr(probe_data, key, value)

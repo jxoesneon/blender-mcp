@@ -160,6 +160,7 @@ class AnimationRiggingHandler(BaseHandler):
 
     @classmethod
     def manage_driver(cls, params: Dict[str, Any]) -> Dict[str, Any]:
+        bpy = cls.get_bpy()
         target = cls._resolve_target(params.get("target_type", "OBJECT"), params["target_name"])
         action = params.get("action", "add_driver")
         data_path = params["data_path"]
@@ -172,12 +173,91 @@ class AnimationRiggingHandler(BaseHandler):
                 target.driver_remove(data_path)
             return {"status": "success", "removed_driver": data_path}
 
-        if hasattr(target, "driver_add"):
-            fc = target.driver_add(data_path, array_index) if array_index >= 0 else target.driver_add(data_path)
-            driver = fc.driver
-            if params.get("driver_expression"):
-                driver.expression = params["driver_expression"]
-        return {"status": "success", "driver": data_path}
+        if action == "add_driver":
+            if hasattr(target, "driver_add"):
+                fc = target.driver_add(data_path, array_index) if array_index >= 0 else target.driver_add(data_path)
+                fcurves = fc if isinstance(fc, list) else [fc]
+                if params.get("driver_expression"):
+                    for fcurve in fcurves:
+                        fcurve.driver.expression = params["driver_expression"]
+            return {"status": "success", "driver": data_path}
+
+        fcurve = cls._get_driver_fcurve(target, data_path, array_index)
+        if not fcurve:
+            raise ValueError(f"No driver found for '{data_path}[{array_index}]'.")
+        driver = fcurve.driver
+
+        if action == "add_variable":
+            var_name = params.get("variable_name")
+            if not var_name:
+                raise ValueError("variable_name is required for add_variable.")
+            var_type = params.get("variable_type", "SINGLE_PROP")
+            var = driver.variables.new()
+            var.name = var_name
+            var.type = var_type
+            target_path = params.get("target_path")
+            target_id_name = params.get("target_id")
+            if var_type == "SINGLE_PROP" and target_path:
+                tgt = var.targets[0]
+                tgt.data_path = target_path
+                if target_id_name:
+                    tgt.id = cls._resolve_target_id(target_id_name)
+            return {"status": "success", "variable": var.name, "driver": data_path}
+
+        if action == "remove_variable":
+            var_name = params.get("variable_name")
+            if not var_name:
+                raise ValueError("variable_name is required for remove_variable.")
+            var = driver.variables.get(var_name)
+            if not var:
+                raise ValueError(f"Driver variable '{var_name}' not found.")
+            driver.variables.remove(var)
+            return {"status": "success", "removed_variable": var_name, "driver": data_path}
+
+        if action == "set_expression":
+            expr = params.get("driver_expression")
+            if expr is None:
+                raise ValueError("driver_expression is required for set_expression.")
+            driver.expression = expr
+            return {"status": "success", "expression": driver.expression, "driver": data_path}
+
+        if action == "get_info":
+            variables = []
+            for var in driver.variables:
+                var_info = {"name": var.name, "type": var.type}
+                if var.type == "SINGLE_PROP" and var.targets:
+                    tgt = var.targets[0]
+                    var_info["data_path"] = getattr(tgt, "data_path", "")
+                    var_info["target_id"] = getattr(getattr(tgt, "id", None), "name", None)
+                variables.append(var_info)
+            return {
+                "status": "success",
+                "driver": data_path,
+                "expression": driver.expression,
+                "type": driver.type,
+                "variables": variables,
+            }
+
+        raise ValueError(f"Unknown driver action: '{action}'")
+
+    @classmethod
+    def _get_driver_fcurve(cls, target: Any, data_path: str, array_index: int) -> Any:
+        anim_data = getattr(target, "animation_data", None)
+        if not anim_data or not anim_data.drivers:
+            return None
+        for fc in anim_data.drivers:
+            if fc.data_path == data_path and (array_index < 0 or fc.array_index == array_index):
+                return fc
+        return None
+
+    @classmethod
+    def _resolve_target_id(cls, name: str) -> Any:
+        bpy = cls.get_bpy()
+        for collection in (bpy.data.objects, bpy.data.materials, bpy.data.worlds, bpy.data.node_groups, bpy.data.scenes):
+            item = collection.get(name)
+            if item:
+                return item
+        return None
 
     @classmethod
     def manage_nla(cls, params: Dict[str, Any]) -> Dict[str, Any]:
