@@ -119,6 +119,33 @@ class MockCollectionDict(dict):
     def __iter__(self):
         return iter(self.values())
 
+    def _find_by_name(self, name):
+        """Search for an item by its current .name attribute (simulating bpy_prop_collection behavior)."""
+        for key, item in self.items():
+            if getattr(item, "name", None) == name:
+                return item
+        return None
+
+    def get(self, key, default=None):
+        if key in self:
+            return self[key]
+        # Fallback: search by current .name attribute (Blender updates lookup keys on rename)
+        found = self._find_by_name(key)
+        return found if found is not None else default
+
+    def __getitem__(self, key):
+        if super().__contains__(key):
+            return super().__getitem__(key)
+        found = self._find_by_name(key)
+        if found is not None:
+            return found
+        raise KeyError(key)
+
+    def __contains__(self, key):
+        if super().__contains__(key):
+            return True
+        return self._find_by_name(key) is not None
+
     def new(self, name: str, *args, **kwargs):
         col_type = getattr(self, "_col_type", "")
         if "objects" in col_type:
@@ -149,9 +176,12 @@ class MockCollectionDict(dict):
         return item
 
     def remove(self, item, do_unlink=True):
-        key = item.name if hasattr(item, "name") else item
-        if key in self:
-            del self[key]
+        name = item.name if hasattr(item, "name") else item
+        # Find the actual dict key (may differ from current name after rename)
+        for dict_key, val in list(self.items()):
+            if val is item or dict_key == name or getattr(val, "name", None) == name:
+                del self[dict_key]
+                return
 
     def load(self, filepath: str, check_existing: bool = True):
         img = MockImage(os.path.basename(filepath))
@@ -288,6 +318,9 @@ class MockMaterial(MockStruct):
         self.node_tree = MockNodeTree(f"{name}_Tree")
     def copy(self):
         mat = MockMaterial(f"{self.name}.001")
+        # In real Blender, mat.copy() auto-registers in bpy.data.materials
+        if _mock_bpy_instance and hasattr(_mock_bpy_instance, "data"):
+            _mock_bpy_instance.data.materials[mat.name] = mat
         return mat
 
 
@@ -873,33 +906,55 @@ class MockWindowManager:
 
 
 class MockOpsCategory:
+    def __init__(self, category_name=""):
+        self._category_name = category_name
+
     def __getattr__(self, name):
+        category = getattr(self, "_category_name", "")
         def mock_op(*args, **kwargs):
+            # Simulate object creation for primitive_add operators
+            if "primitive" in name and "add" in name:
+                bpy = _mock_bpy_instance
+                if bpy and hasattr(bpy, "data"):
+                    obj_name = kwargs.get("name", f"{name}_obj")
+                    obj = bpy.data.objects.new(obj_name)
+                    bpy.context.view_layer.objects.active = obj
+                    bpy.context.view_layer.objects.selected = [obj]
+            elif name == "empty_add" or name == "camera_add" or name == "light_add" or name == "armature_add":
+                bpy = _mock_bpy_instance
+                if bpy and hasattr(bpy, "data"):
+                    obj_name = kwargs.get("name", f"{name}_obj")
+                    obj = bpy.data.objects.new(obj_name)
+                    bpy.context.view_layer.objects.active = obj
+                    bpy.context.view_layer.objects.selected = [obj]
             return {"FINISHED"}
         return mock_op
 
 
+_mock_bpy_instance = None
+
+
 class MockOps:
     def __init__(self):
-        self.mesh = MockOpsCategory()
-        self.curve = MockOpsCategory()
-        self.object = MockOpsCategory()
-        self.preferences = MockOpsCategory()
-        self.file = MockOpsCategory()
-        self.render = MockOpsCategory()
-        self.uv = MockOpsCategory()
-        self.rigidbody = MockOpsCategory()
-        self.ptcache = MockOpsCategory()
-        self.ed = MockOpsCategory()
-        self.wm = MockOpsCategory()
-        self.import_scene = MockOpsCategory()
-        self.export_scene = MockOpsCategory()
-        self.import_mesh = MockOpsCategory()
-        self.export_mesh = MockOpsCategory()
-        self.import_anim = MockOpsCategory()
-        self.export_anim = MockOpsCategory()
-        self.import_curve = MockOpsCategory()
-        self.blendermcp = MockOpsCategory()
+        self.mesh = MockOpsCategory("mesh")
+        self.curve = MockOpsCategory("curve")
+        self.object = MockOpsCategory("object")
+        self.preferences = MockOpsCategory("preferences")
+        self.file = MockOpsCategory("file")
+        self.render = MockOpsCategory("render")
+        self.uv = MockOpsCategory("uv")
+        self.rigidbody = MockOpsCategory("rigidbody")
+        self.ptcache = MockOpsCategory("ptcache")
+        self.ed = MockOpsCategory("ed")
+        self.wm = MockOpsCategory("wm")
+        self.import_scene = MockOpsCategory("import_scene")
+        self.export_scene = MockOpsCategory("export_scene")
+        self.import_mesh = MockOpsCategory("import_mesh")
+        self.export_mesh = MockOpsCategory("export_mesh")
+        self.import_anim = MockOpsCategory("import_anim")
+        self.export_anim = MockOpsCategory("export_anim")
+        self.import_curve = MockOpsCategory("import_curve")
+        self.blendermcp = MockOpsCategory("blendermcp")
 
 
 class MockTypes:
@@ -1044,7 +1099,9 @@ class MockBPY:
 
 
 def install_mocks():
+    global _mock_bpy_instance
     mock_bpy = MockBPY()
+    _mock_bpy_instance = mock_bpy
     sys.modules["bpy"] = mock_bpy
     sys.modules["bmesh"] = MockBMeshModule()
     sys.modules["mathutils"] = MockMathutilsModule()
